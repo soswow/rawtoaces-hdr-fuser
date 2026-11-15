@@ -1,0 +1,6 @@
+/build/
+/build-*/
+__pycache__/
+/docs/PIPELINE_DESIGN.md
+/docs/REVIEW.md
+/tests/real_captures.py
