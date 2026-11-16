@@ -32,12 +32,109 @@ Mask intersection(const Mask& a, Mask b) {
     return b;
 }
 
+// Masks are empty when they select every site.
+Mask unite(const Mask& a, const Mask& b) {
+    if (a.empty() || b.empty()) return {};
+    Mask result = a;
+    for (size_t i = 0; i < b.size(); ++i) result[i] |= b[i];
+    return result;
+}
+
+Mask subtract(const Mask& a, const Mask& b, size_t size) {
+    if (b.empty()) return a;
+    Mask result = a.empty() ? Mask(size, 1) : a;
+    for (size_t i = 0; i < size; ++i) result[i] &= !b[i];
+    return result;
+}
+
 int quality(const Site& site) {
     if (site.flags & missing) return 0;
     if (site.flags & lowerBound) return 1;
     if (site.flags & adjacentClipFallback) return 2;
     return 3;
 }
+
+// Offset matching works on cells of matchCell² sites, per colour.
+constexpr int matchCell = 32;
+constexpr size_t matchMinimum = 16;
+constexpr double matchRelativeVariance = 0.01;  // SNR of at least 10
+
+bool precise(const Site& site) {
+    return quality(site) == 3 && site.signal > 0 &&
+           site.variance < matchRelativeVariance * double(site.signal) * site.signal;
+}
+
+// Membrane (harmonic) interpolation: unknown cells take the average of their
+// neighbours, with known cells fixed. Cells in a component without a known cell
+// stay unreached.
+void membrane(std::vector<double>& value, const std::vector<uint8_t>& known, int rows, int cols,
+              std::vector<uint8_t>& reached) {
+    reached = known;
+    std::vector<size_t> queue;
+    for (size_t i = 0; i < known.size(); ++i) if (known[i]) queue.push_back(i);
+    // Nearest-known start, then Gauss-Seidel with over-relaxation.
+    for (size_t head = 0; head < queue.size(); ++head) {
+        const int r = int(queue[head] / cols), c = int(queue[head] % cols);
+        const int dr[] = {-1, 1, 0, 0}, dc[] = {0, 0, -1, 1};
+        for (int k = 0; k < 4; ++k) {
+            const int rr = r + dr[k], cc = c + dc[k];
+            if (rr < 0 || rr >= rows || cc < 0 || cc >= cols) continue;
+            const size_t j = size_t(rr) * cols + cc;
+            if (reached[j]) continue;
+            reached[j] = 1;
+            value[j] = value[queue[head]];
+            queue.push_back(j);
+        }
+    }
+    double scale = 0;
+    for (size_t i = 0; i < known.size(); ++i) if (known[i]) scale = std::max(scale, std::abs(value[i]));
+    const double tolerance = 1e-6 * std::max(scale, 1e-12);
+    for (int iteration = 0; iteration < 5000; ++iteration) {
+        double change = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                const size_t i = size_t(r) * cols + c;
+                if (known[i] || !reached[i]) continue;
+                double sum = 0;
+                int n = 0;
+                if (r > 0) { sum += value[i - cols]; ++n; }
+                if (r + 1 < rows) { sum += value[i + cols]; ++n; }
+                if (c > 0) { sum += value[i - 1]; ++n; }
+                if (c + 1 < cols) { sum += value[i + 1]; ++n; }
+                const double next = value[i] + 1.8 * (sum / n - value[i]);
+                change = std::max(change, std::abs(next - value[i]));
+                value[i] = next;
+            }
+        if (change < tolerance) break;
+    }
+}
+
+struct OffsetField {
+    int rows = 0, cols = 0;
+    std::array<std::vector<double>, 3> value;
+    std::array<std::vector<uint8_t>, 3> reached;
+
+    // Bilinear between cell centres; false where no cell nearby was reached.
+    bool at(int y, int x, int colour, double& offset) const {
+        const double fy = std::clamp((y + 0.5) / matchCell - 0.5, 0.0, double(rows - 1));
+        const double fx = std::clamp((x + 0.5) / matchCell - 0.5, 0.0, double(cols - 1));
+        const int r0 = int(fy), c0 = int(fx);
+        const int r1 = std::min(r0 + 1, rows - 1), c1 = std::min(c0 + 1, cols - 1);
+        const double wy = fy - r0, wx = fx - c0;
+        const int rs[] = {r0, r0, r1, r1}, cs[] = {c0, c1, c0, c1};
+        const double ws[] = {(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx};
+        double sum = 0, weight = 0;
+        for (int k = 0; k < 4; ++k) {
+            const size_t i = size_t(rs[k]) * cols + cs[k];
+            if (!reached[colour][i]) continue;
+            sum += ws[k] * value[colour][i];
+            weight += ws[k];
+        }
+        if (weight <= 1e-9) return false;
+        offset = sum / weight;
+        return true;
+    }
+};
 
 } // namespace
 
@@ -57,7 +154,8 @@ std::vector<InputGroup> readGroups(const fs::path& path) {
         size_t totalFrames = 0;
         for (const auto& entry : entries) {
             validateKeys(entry, {"name", "frames", "valid_mask", "contribution_mask",
-                                 "calibration_mask", "calibration_reference", "ev"});
+                                 "calibration_mask", "drift_mask", "calibration_reference", "ev",
+                                 "match"});
             InputGroup group;
             group.name = entry.at("name").get<std::string>();
             if (group.name.empty() || indices.count(group.name))
@@ -73,6 +171,7 @@ std::vector<InputGroup> readGroups(const fs::path& path) {
                 group.contributionMask = inputPath(entry.at("contribution_mask"), directory);
             if (entry.contains("calibration_mask"))
                 group.calibrationMask = inputPath(entry.at("calibration_mask"), directory);
+            if (entry.contains("drift_mask")) group.driftMask = inputPath(entry.at("drift_mask"), directory);
 
             if (entry.contains("ev")) {
                 const auto& ev = entry.at("ev");
@@ -83,11 +182,18 @@ std::vector<InputGroup> readGroups(const fs::path& path) {
                     group.ev = RGB{neutral, neutral, neutral};
                 } else throw std::runtime_error(group.name + ": ev must be auto, a number, or three RGB values");
             }
+            if (entry.contains("match")) {
+                const auto& match = entry.at("match");
+                if (match != "offset" && match != "none")
+                    throw std::runtime_error(group.name + ": match must be offset or none");
+                group.matchOffset = match == "offset";
+            }
             if (group.ev)
                 for (const double ev : *group.ev)
                     if (!std::isfinite(ev) || ev < 0 || ev > 64)
                         throw std::runtime_error(group.name + ": ev must be between 0 and 64");
-            const bool hasCalibration = !group.calibrationMask.empty() || entry.contains("calibration_reference");
+            const bool hasCalibration = !group.calibrationMask.empty() || !group.driftMask.empty() ||
+                                        entry.contains("calibration_reference");
             if (hasCalibration && !group.ev && !group.autoEV)
                 throw std::runtime_error(group.name + ": calibration settings require ev");
             if (group.autoEV || hasCalibration) {
@@ -140,50 +246,168 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
             const size_t ref = size_t(std::find_if(o.groups.begin(), o.groups.end(), [&](const InputGroup& a) {
                 return a.name == group.calibrationReference;
             }) - o.groups.begin());
-            const auto mask = intersection(validity[g],
-                intersection(validity[ref], sidecars.calibration[g]));
-            auto reference = mergePlain(*frames[ref], ref ? automaticReference : o, mask);
+            const auto& drift = sidecars.drift[g];
+            const auto mask = subtract(intersection(validity[g],
+                intersection(validity[ref], sidecars.calibration[g])), drift, layout.size());
+            const auto driftSites = drift.empty() ? Mask() : intersection(validity[ref], drift);
+            const auto selection = driftSites.empty() ? mask : unite(mask, driftSites);
+            auto reference = mergePlain(*frames[ref], ref ? automaticReference : o, selection);
             try {
                 groupResult.calibration = calibrateND(reference, *frames[ref], *frames[g], mask,
-                                                     group.ev, false, o, warnings);
+                                                     driftSites, group.ev, o, warnings);
             } catch (const std::exception& error) {
                 throw std::runtime_error(group.name + ": " + error.what());
             }
             groupResult.ev = groupResult.calibration->ev;
         }
 
-        const auto selection = intersection(validity[g], sidecars.contribution[g]);
+        // The group is merged wherever it is valid. Inside its contribution mask it
+        // replaces equal-quality samples; everywhere else it only fills sites that
+        // earlier groups measured worse.
+        const auto& contributionMask = sidecars.contribution[g];
+        const auto& selection = validity[g];
         auto contribution = mergePlain(*frames[g], g ? automaticReference : o, selection, true);
         if (!g) result.mosaic.reference = contribution.reference;
         RGB gain = unitWB;
         for (int c = 0; c < 3; ++c) gain[c] = std::exp2(groupResult.ev[c]);
+        auto replacesAt = [&](size_t i) { return !g || (!contributionMask.empty() && contributionMask[i]); };
+
+        // An additive offset between this group and the composite so far (the open
+        // bracket's glare veil against a blocked bracket, for example), measured
+        // outside the replacement area where both are precise.
+        std::optional<OffsetField> field;
+        if (g && group.matchOffset) {
+            OffsetField f;
+            f.rows = (layout.height + matchCell - 1) / matchCell;
+            f.cols = (layout.width + matchCell - 1) / matchCell;
+            const size_t cells = size_t(f.rows) * f.cols;
+            std::array<std::vector<uint8_t>, 3> known;
+            for (int c = 0; c < 3; ++c) {
+                f.value[c].assign(cells, 0);
+                known[c].assign(cells, 0);
+            }
+            std::vector<size_t> rowSamples(f.rows);
+            parallelRows(f.rows, o.threads, [&](int cellRow) {
+                std::vector<std::array<std::vector<float>, 3>> samples(f.cols);
+                const int end = std::min(layout.height, (cellRow + 1) * matchCell);
+                for (int y = cellRow * matchCell; y < end; ++y)
+                    for (int x = 0; x < layout.width; ++x) {
+                        const size_t i = layout.index(y, x);
+                        if ((!selection.empty() && !selection[i]) || replacesAt(i)) continue;
+                        const auto& before = result.mosaic.sites[i];
+                        const auto& site = contribution.sites[i];
+                        if (!precise(before) || !precise(site)) continue;
+                        const int colour = layout.colour(y, x);
+                        const double factor = attenuated ? gain[colour] : 1;
+                        samples[x / matchCell][colour].push_back(float(site.signal * factor - before.signal));
+                    }
+                for (int c = 0; c < f.cols; ++c)
+                    for (int colour = 0; colour < 3; ++colour) {
+                        auto& values = samples[c][colour];
+                        rowSamples[cellRow] += values.size();
+                        if (values.size() < matchMinimum) continue;
+                        const size_t cell = size_t(cellRow) * f.cols + c;
+                        auto middle = values.begin() + values.size() / 2;
+                        std::nth_element(values.begin(), middle, values.end());
+                        f.value[colour][cell] = *middle;
+                        known[colour][cell] = 1;
+                    }
+            });
+            OffsetMatch match;
+            for (const size_t n : rowSamples) match.samples += n;
+            for (int c = 0; c < 3; ++c)
+                for (const auto k : known[c]) match.knownCells += k;
+            if (std::all_of(known.begin(), known.end(), [](const auto& k) {
+                return std::find(k.begin(), k.end(), 1) != k.end();
+            })) {
+                for (int c = 0; c < 3; ++c) membrane(f.value[c], known[c], f.rows, f.cols, f.reached[c]);
+                field = std::move(f);
+            }
+            groupResult.match = match;
+        }
+
+        struct RowMatch {
+            size_t corrected = 0, unresolved = 0, capped = 0;
+            std::array<std::vector<float>, 3> offset, share;
+        };
+        std::vector<RowMatch> rowMatch(field ? layout.height : 0);
         parallelRows(layout.height, o.threads, [&](int y) {
             for (int x = 0; x < layout.width; ++x) {
                 const size_t i = layout.index(y, x);
                 if (!selection.empty() && !selection[i]) continue;
                 auto& current = result.mosaic.sites[i];
                 auto site = contribution.sites[i];
-                const int rank = quality(site);
-                if (rank < quality(current)) continue;
+                const bool replaces = replacesAt(i);
+                const int rank = quality(site), held = quality(current);
+                if (rank < held || (rank == held && rank > 1 && !replaces)) continue;
                 if (rank == 0) {
                     current = site;
                     continue;
                 }
+                const int colour = layout.colour(y, x);
                 if (attenuated) {
-                    const double factor = gain[layout.colour(y, x)];
+                    const double factor = gain[colour];
                     site.signal = float(site.signal * factor);
                     site.variance = float(site.variance * factor * factor);
                     if (!std::isfinite(site.signal) || !std::isfinite(site.variance))
                         throw std::runtime_error(group.name + ": attenuation correction overflows float32");
                     site.flags |= fromND;
                 }
+                double offset = 0;
+                const bool resolved = field && field->at(y, x, colour, offset);
+                // The veil is part of what the group measured, so an interpolated offset
+                // larger than the measurement is wrong there; remove at most all of it.
+                bool capped = false;
+                if (offset > site.signal && site.signal > 0) {
+                    offset = site.signal;
+                    capped = true;
+                }
+                const float uncorrected = site.signal;
+                site.signal = float(site.signal - offset);
                 // Between two clipping bounds, keep the more informative (higher) one.
-                if (rank == 1 && quality(current) == 1 && site.signal <= current.signal) continue;
+                if (rank == 1 && held == 1 && site.signal <= current.signal) continue;
+                // A measurement well below an earlier clipping bound contradicts it: the
+                // scene, glare, masks or attenuation differ. A contribution mask asks for
+                // this group regardless; a filling group keeps the bound.
+                if (rank > 1 && held == 1 && site.signal < 0.9f * current.signal) {
+                    if (!replaces) {
+                        current.flags |= inconsistent;
+                        continue;
+                    }
+                    site.flags |= inconsistent;
+                }
                 current = site;
                 result.sources[i] = uint32_t(g + 1);
                 shadows[i] = contribution.shadowSites[i];
+                if (!field) continue;
+                auto& row = rowMatch[y];
+                if (!resolved) {
+                    ++row.unresolved;
+                    continue;
+                }
+                ++row.corrected;
+                row.capped += capped;
+                row.offset[colour].push_back(float(offset));
+                if (uncorrected > 0) row.share[colour].push_back(float(offset / uncorrected));
             }
         });
+        if (field) {
+            auto& match = *groupResult.match;
+            std::array<std::vector<double>, 3> offsets, shares;
+            for (auto& row : rowMatch) {
+                match.corrected += row.corrected;
+                match.unresolved += row.unresolved;
+                match.capped += row.capped;
+                for (int c = 0; c < 3; ++c) {
+                    offsets[c].insert(offsets[c].end(), row.offset[c].begin(), row.offset[c].end());
+                    shares[c].insert(shares[c].end(), row.share[c].begin(), row.share[c].end());
+                }
+            }
+            for (int c = 0; c < 3; ++c) {
+                if (!offsets[c].empty()) match.median[c] = median(offsets[c]);
+                if (!shares[c].empty()) match.share[c] = median(shares[c]);
+            }
+        }
         for (size_t r = 0; r <= g; ++r)
             if (lastUse[r] == g) releaseMosaics(*frames[r]);
     }

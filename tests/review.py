@@ -2,7 +2,9 @@
 
 import json
 import itertools
+import math
 from pathlib import Path
+import random
 import struct
 import subprocess
 import sys
@@ -147,7 +149,8 @@ class ReviewTests(unittest.TestCase):
         manifest = self.folder / "groups.json"
         manifest.write_text(json.dumps({"groups": [
             {"name": "base", "frames": [base.name]},
-            {"name": "nd", "frames": [nd.name], "ev": 1, "valid_mask": mask.name}]}))
+            {"name": "nd", "frames": [nd.name], "ev": 1, "valid_mask": mask.name,
+             "contribution_mask": mask.name}]}))
         matrix = self.folder / "red.txt"
         matrix.write_text("1 0 0\n1 0 0\n1 0 0\n")
         _, rgb = self.fuse("highlight", "--groups", manifest, "--aux", "--space", "aces",
@@ -223,12 +226,192 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(rgb["flags"][i] & (8 | 16), 8 | 16)
         self.assertTrue(any("no capture time" in w for w in report["warnings"]))
 
-    def test_nd_all_updates_shadow_statistics(self):
-        plain, nd = self.folder / "plain.dng", self.folder / "nd.dng"
-        dng(plain, (1, 1000), lambda y, x, c: 0.001)
-        dng(nd, (1, 10), lambda y, x, c: 0.05)
-        report, _ = self.fuse("nd", plain, "--nd", nd, "--nd-ev", "1", "--nd-use", "all")
-        self.assertEqual(report["merge"]["shadow_fraction"], 0)
+    def test_frames_use_their_own_black_levels(self):
+        # LibRaw measures some cameras' black level per frame (Canon CR3 varies by
+        # 1 DN). Each frame must be fused against its own level.
+        long, short = self.folder / "long.dng", self.folder / "short.dng"
+        dng(long, (1, 10), lambda y, x, c: 0.2)
+        dng(short, (1, 40), lambda y, x, c: 0.05, black_pattern=(4596,) * 4)
+        report, rgb = self.fuse("own-black", long, short, "--no-deghost")
+        # Both frames measure 2 per second; the geometric-mean scale is 0.05 s.
+        for c in "RGB":
+            close(rgb[c][1000], 0.1)
+        self.assertTrue(any("levels differ between frames" in w for w in report["warnings"]))
+        self.assertEqual([i["black_level"][0] for i in report["inputs"]], [4096, 4596])
+
+    def test_later_group_without_contribution_mask_only_fills(self):
+        base, nd = self.folder / "base.dng", self.folder / "nd.dng"
+        dng(base, (1, 10), lambda y, x, c: 1 if x < 64 else 0.2)
+        dng(nd, (1, 10), lambda y, x, c: 0.3 if x < 64 else 0.05)
+        manifest = self.folder / "groups.json"
+        manifest.write_text(json.dumps({"groups": [
+            {"name": "base", "frames": [base.name]}, {"name": "nd", "frames": [nd.name], "ev": 2}]}))
+        report, rgb = self.fuse("fill", "--groups", manifest, "--aux")
+        row = 40 * SIZE
+        close(rgb["G"][row + 20], 1.2)  # The clipped base is filled from the filtered group.
+        close(rgb["G"][row + 100], 0.2)  # Clean base sites are kept.
+        self.assertEqual([rgb["source"][row + x] for x in (20, 100)], [2, 1])
+
+        # A filtered value below the clipping bound contradicts it; the bound is kept.
+        dng(nd, (1, 10), lambda y, x, c: 0.1 if x < 64 else 0.05)
+        report, rgb = self.fuse("inconsistent", "--groups", manifest, "--aux", "--highlights", "bound",
+                                "--force")
+        self.assertEqual(rgb["flags"][row + 20] & (1 | 32), 1 | 32)
+        self.assertEqual(rgb["source"][row + 20], 1)
+        self.assertGreater(report["merge"]["inconsistent_fraction"], 0.4)
+
+    def stick_brackets(self):
+        # A blocked bracket whose blocker (a stick, columns 56-71) is excluded, and an
+        # open bracket that sees the whole scene through a smooth additive glare veil.
+        def scene(y, x):
+            return 0.1 + 0.08 * (((x // 16) + (y // 16)) % 2)
+        def veil(y, x):
+            return 0.05 + 0.1 * x / SIZE
+        blocked, open_ = self.folder / "blocked.dng", self.folder / "open.dng"
+        dng(blocked, (1, 10), lambda y, x, c: 0 if 56 <= x < 72 else scene(y, x))
+        dng(open_, (1, 10), lambda y, x, c: scene(y, x) + veil(y, x))
+        def mask(name, selected):
+            path = self.folder / name
+            row = bytes(255 if selected(x) else 0 for x in range(SIZE))
+            path.write_bytes(f"P5\n{SIZE} {SIZE}\n255\n".encode() + row * SIZE)
+            return path.name
+        return scene, veil, blocked, open_, mask
+
+    def test_offset_match_removes_the_open_brackets_glare_veil(self):
+        scene, veil, blocked, open_, mask = self.stick_brackets()
+        manifest = self.folder / "groups.json"
+        def write(match):
+            group = {"name": "open", "frames": [open_.name],
+                     "contribution_mask": mask("stick.pgm", lambda x: 56 <= x < 72)}
+            if match:
+                group["match"] = match
+            manifest.write_text(json.dumps({"groups": [
+                {"name": "blocked", "frames": [blocked.name],
+                 "valid_mask": mask("outside.pgm", lambda x: not 56 <= x < 72)}, group]}))
+            return manifest
+        report, rgb = self.fuse("veil", "--groups", write(None), "--aux")
+        match = report["groups"][1]["offset_match"]
+        self.assertGreater(match["overlap_samples"], 10000)
+        self.assertEqual(match["corrected_sites"], 16 * SIZE)
+        close(match["median_offset"]["G"], veil(0, 64), 0.01)
+        # Sites away from the texture's edges, where demosaicing reproduces it exactly.
+        for y in (24, 40, 104):
+            for x in (58, 61, 68):
+                i = y * SIZE + x
+                self.assertEqual(rgb["source"][i], 2)
+                close(rgb["G"][i], scene(y, x), 0.01)
+        report, rgb = self.fuse("veil-kept", "--groups", write("none"), "--aux")
+        self.assertIsNone(report["groups"][1]["offset_match"])
+        i = 40 * SIZE + 61
+        close(rgb["G"][i], scene(40, 61) + veil(40, 61), 0.005)
+
+    def test_contribution_mask_group_also_fills_gaps_outside_the_mask(self):
+        scene, veil, blocked, open_, mask = self.stick_brackets()
+        manifest = self.folder / "groups.json"
+        # The blocked bracket is also invalid in columns 100-109, outside the open
+        # bracket's contribution mask; the open bracket fills them rather than leaving
+        # them missing, and its glare veil is removed there too.
+        manifest.write_text(json.dumps({"groups": [
+            {"name": "blocked", "frames": [blocked.name],
+             "valid_mask": mask("outside.pgm", lambda x: not (56 <= x < 72 or 100 <= x < 110))},
+            {"name": "open", "frames": [open_.name], "contribution_mask": mask("stick.pgm", lambda x: 56 <= x < 72)}]}))
+        report, rgb = self.fuse("gaps", "--groups", manifest, "--aux")
+        i = 40 * SIZE + 104
+        self.assertEqual(rgb["source"][i], 2)
+        self.assertEqual(rgb["flags"][i] & 16, 0)
+        close(rgb["G"][i], scene(40, 104), 0.01)
+        self.assertEqual(report["merge"]["missing_fraction"], 0)
+        # Clean blocked samples outside the mask are kept.
+        self.assertEqual(rgb["source"][64 * SIZE + 20], 1)
+
+    def test_status_lines_and_quiet(self):
+        frame = self.folder / "status.dng"
+        dng(frame, (1, 10), lambda y, x, c: 0.2)
+        output = self.folder / "status.exr"
+        result = subprocess.run([EXE, str(frame), "-o", str(output)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in ("rawfuse: read 1 frames in 1 group", "rawfuse: plain: 1 frame",
+                     "rawfuse: noise: DNG NoiseProfile", "rawfuse: plain: supplies",
+                     "rawfuse: result: 0% of sites missing", "rawfuse: wrote " + str(output)):
+            self.assertIn(line, result.stderr)
+        self.assertEqual(result.stdout, "")
+        result = subprocess.run([EXE, "-q", "--force", str(frame), "-o", str(output)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(line.startswith("rawfuse: warning:") for line in result.stderr.splitlines()))
+
+    def test_measured_exposure_ratio_replaces_rounded_exif(self):
+        # The long frame's real exposure is 0.1 EV longer than its EXIF label.
+        long, short = self.folder / "long.dng", self.folder / "short.dng"
+        true_ratio = 4 * 2 ** 0.1
+        dng(long, (1, 10), lambda y, x, c: 0.05 * true_ratio)
+        dng(short, (1, 40), lambda y, x, c: 0.05)
+        report, rgb = self.fuse("measured", long, short, "--no-deghost")
+        step, = report["groups"][0]["exposure_steps"]
+        self.assertTrue(step["applied"])
+        close(step["exif_ratio"], 4)
+        close(step["measured_ratio"], true_ratio, 1e-3)
+        corrections = [i["exposure_correction_ev"] for i in report["inputs"]]
+        close(corrections[0], 0.05, 1e-3)
+        close(corrections[1], -0.05, 1e-3)
+        # Both frames now agree: 0.05 at sqrt(0.025 · 0.1 / ratio) seconds, scaled to the 0.05 s mean.
+        expected = 0.05 / math.sqrt(0.0025 / true_ratio) * 0.05
+        for c in "RGB":
+            close(rgb[c][1000], expected, 1e-3)
+
+        report, _ = self.fuse("exif", long, short, "--no-deghost", "--exposures", "exif")
+        self.assertEqual(report["groups"][0]["exposure_steps"], [])
+        self.assertEqual(report["inputs"][0]["exposure_correction_ev"], 0)
+
+        # A ratio far from EXIF is not trusted.
+        dng(long, (1, 10), lambda y, x, c: 0.05 * 4 * 2 ** 0.5)
+        report, _ = self.fuse("far", long, short, "--no-deghost")
+        self.assertFalse(report["groups"][0]["exposure_steps"][0]["applied"])
+        self.assertTrue(any("differs from EXIF by 0.50 EV" in w for w in report["warnings"]))
+
+    def test_unmeasurable_step_borrows_the_camera_shutter_correction(self):
+        true_ratio = 4 * 2 ** 0.1
+        frames = {}
+        for name, scale in (("plain", 1), ("filtered", 0.004)):
+            long, short = self.folder / f"{name}-long.dng", self.folder / f"{name}-short.dng"
+            dng(long, (1, 10), lambda y, x, c: 0.05 * true_ratio * scale)
+            dng(short, (1, 40), lambda y, x, c: 0.05 * scale)
+            frames[name] = [long.name, short.name]
+        manifest = self.folder / "groups.json"
+        manifest.write_text(json.dumps({"groups": [
+            {"name": "plain", "frames": frames["plain"]},
+            {"name": "filtered", "frames": frames["filtered"], "ev": 8}]}))
+        report, _ = self.fuse("borrowed", "--groups", manifest, "--no-deghost")
+        step, = report["groups"][1]["exposure_steps"]
+        self.assertFalse(step["applied"])
+        self.assertEqual(step["borrowed_from"], "plain")
+        close(step["ratio"], true_ratio, 1e-3)
+        self.assertFalse(any("could not be measured" in w for w in report["warnings"]))
+
+    def test_noise_is_measured_without_noise_profile(self):
+        shot, read = 2e-4, 1e-6
+        generator = random.Random(7)
+        width = 256
+        def scene(scale):
+            def value(y, x, c):
+                signal = 0.002 * (0.85 / 0.002) ** (x / (width - 1)) * scale
+                return signal + generator.gauss(0, math.sqrt(shot * signal + read))
+            return value
+        long, short = self.folder / "noisy-long.dng", self.folder / "noisy-short.dng"
+        dng(long, (1, 10), scene(1), width=width, height=width, noise=None)
+        dng(short, (1, 40), scene(0.25), width=width, height=width, noise=None)
+        report, _ = self.fuse("noisy", long, short, "--no-deghost")
+        fit, = report["noise_fits"]
+        self.assertEqual(fit["read_noise"], "bracket")
+        close(fit["S"], shot, 0.1)
+        close(fit["O"], read, 0.3)
+        self.assertEqual({i["noise_profile"]["source"] for i in report["inputs"]}, {"measured"})
+        self.assertFalse(any("generic" in w for w in report["warnings"]))
+
+        # A single frame cannot be measured and gets a generic profile with a warning.
+        report, _ = self.fuse("generic", long)
+        self.assertEqual(report["noise_profile"]["source"], "generic")
+        self.assertTrue(any("generic profile" in w for w in report["warnings"]))
 
 
 if __name__ == "__main__":

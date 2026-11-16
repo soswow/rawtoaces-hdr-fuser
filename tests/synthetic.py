@@ -61,10 +61,12 @@ def dng(path, exposure, value, *, order="<", width=SIZE, height=SIZE,
         entry(284, 3, "H", 1), entry(33421, 3, "H", 2, 2),
         # CFAPattern stores colour codes; CFAPlaneColor maps planes to the same codes.
         blob(33422, 1, bytes(cfa)),
-        ratio(50714, (BLACK, 1)), entry(50717, 4, "I", WHITE), entry(51041, 12, "d", *noise),
+        ratio(50714, (BLACK, 1)), entry(50717, 4, "I", WHITE),
         ratio(50718, (1, 1), (1, 1)), entry(50719, 4, "I", 0, 0),
         entry(50720, 4, "I", width, height),
     ]
+    if noise:
+        raw.append(entry(51041, 12, "d", *noise))
     if active:
         top, left, bottom, right = active
         raw = [tag for tag in raw if tag[0] != 50720]
@@ -340,7 +342,7 @@ def main(exe, folder):
         bad=point)
     report, (_, repaired) = fuse("repair", hot, "--aux", "--dark-model", sparse_model)
     close(repaired["R"][dark_index], 0.4)
-    assert report["dark_model"]["plain"]["method"] == "unavailable"
+    assert report["groups"][0]["dark_model"]["method"] == "unavailable"
     assert repaired["flags"][dark_index] & (8 | 16) == (8 | 16)
 
     offsets = {(y, x): 2400.0 for y in range(10, 70, 8) for x in (10, 18, 26, 34, 42)}
@@ -362,7 +364,7 @@ def main(exe, folder):
         hot_frames.append(hot_frame)
     report, (_, corrected) = fuse("dark", *hot_frames, "--dark-model", dark_model, "--aux",
                                   "--normalize", "none", "--noise", "0.000001,0.000000001")
-    fit = report["dark_model"]["plain"]
+    fit = report["groups"][0]["dark_model"]
     assert fit["method"] == "separate_scales"
     close(fit["offset_scale"], 0.65, 0.017)
     close(fit["rate_scale"], 0.25, 0.007)
@@ -387,7 +389,7 @@ def main(exe, folder):
     assert report["inputs"][0]["hot_sites"]["missing"] == 401
     for name in "RGB":
         close(active[name][10 * 120 + 10], 0.25)
-    fuse("incompatible", a, crop, error="active area or black/white levels differ")
+    fuse("incompatible", a, crop, error="camera, CFA or active area differ")
 
     gain_data = struct.pack(">10I4dI4f", 0, 0, SIZE, SIZE, 0, 1, 1, 1, 2, 2,
                             1 - 1 / SIZE, 1 - 1 / SIZE, 0.5 / SIZE, 0.5 / SIZE, 1, 1, 2, 3, 4)
@@ -418,30 +420,57 @@ def main(exe, folder):
         math.exp2(evs[c]) if x < 224 else 0.25, **dims)
     dng(drift, (1, 10000), lambda y, x, c: plain_signal(y, x) /
         math.exp2(evs[c]) if x < 224 else 0.125, **dims)
-    dng(no_overlap, (1, 10000), lambda y, x, c: 0.01, **dims)
+    dng(no_overlap, (1, 10000), lambda y, x, c: 0.005, **dims)
     mask.write_bytes(b"P5\n256 256\n255\n" + (bytes([255]) * 224 + bytes(32)) * 256)
-    report, (_, nd_image) = fuse("nd", base, "--nd", filter_frame, uncovered, "--nd-mask", mask, "--aux")
+    unfiltered = folder / "unfiltered.pgm"
+    unfiltered.write_bytes(b"P5\n256 256\n255\n" + (bytes(224) + bytes([255]) * 32) * 256)
+    nd_manifest = folder / "nd-groups.json"
+
+    def nd_groups(frames, ev="auto", drift_mask=True, match=None):
+        filtered = {"name": "filter", "frames": [f.name for f in frames], "ev": ev, "valid_mask": mask.name}
+        if drift_mask:
+            filtered["drift_mask"] = unfiltered.name
+        if match:
+            filtered["match"] = match
+        nd_manifest.write_text(json.dumps({"groups": [{"name": "plain", "frames": [base.name]}, filtered]}))
+        return nd_manifest
+
+    report, (_, nd_image) = fuse("nd", "--groups", nd_groups([filter_frame, uncovered]), "--aux")
+    calibration = report["groups"][1]["calibration"]
     for c, ev in zip("RGB", evs):
-        close(report["nd"]["ev"][c], ev, 0.001)
+        close(report["groups"][1]["ev"][c], ev, 0.001)
         close(nd_image[c][130 * 256 + 208], 2, 0.005)
         close(nd_image[c][130 * 256 + 242], 0.25)
-    assert {"row": 0, "col": 0} in report["nd"]["blocks_removed"]
-    assert report["nd"]["blocked_lower_bound_sites"] == 64
-    close(report["nd"]["scene_drift_ev"], 0)
+    # Without a contribution mask the filtered group only fills clipped sites.
+    assert nd_image["source"][130 * 256 + 208] == 2 and nd_image["source"][130 * 256 + 130] == 1
     assert nd_image["flags"][130 * 256 + 208] & 2
-    fuse("nd-fail", base, "--nd", no_overlap, error="exposure windows can overlap up to 4.14 EV")
-    fuse("nd-drift-fail", base, "--nd", filter_frame, drift, "--nd-mask", mask, "--nd-ev",
-         "9.8", error="ND scene drift of -1.00 EV exceeds 0.20 EV")
+    # A deviating calibration block is reported, but still fills its clipped sites.
+    assert {"row": 0, "col": 0} in calibration["blocks_flagged"]
+    assert any("calibration blocks differ" in w for w in report["warnings"])
+    # Offset matching against the surrounding plain samples pulls that fill towards
+    # the truth (2); without it the deviating block's own value is used.
+    deviating = 2 / math.exp2(0.55)
+    assert deviating + 0.1 < nd_image["G"][20 * 256 + 20] < 2
+    assert report["groups"][1]["offset_match"]["corrected_sites"] > 0
+    unmatched, (_, raw_fill) = fuse("nd-unmatched", "--groups", nd_groups([filter_frame, uncovered], match="none"),
+                                    "--aux")
+    close(raw_fill["G"][20 * 256 + 20], deviating, 0.005)
+    assert unmatched["groups"][1]["offset_match"] is None
+    close(calibration["scene_drift_ev"], 0)
+    assert calibration["scene_drift_samples"] >= 100
+    fuse("nd-fail", "--groups", nd_groups([no_overlap], drift_mask=False),
+         error="filter: insufficient overlap with the calibration reference (R/G/B 0/0/0")
+    fuse("nd-drift-fail", "--groups", nd_groups([filter_frame, drift], 9.8),
+         error="scene drift of -1.00 EV exceeds 0.20 EV")
     assert not (folder / "nd-drift-fail.exr").exists()
-    auto, _ = fuse("nd-auto-drift", base, "--nd", filter_frame, drift, "--nd-mask", mask)
-    assert any("ND scene drift" in w for w in auto["warnings"])
-
-    report, (_, supplied) = fuse("nd-manual", base, "--nd", filter_frame, drift,
-                                   "--nd-mask", mask, "--nd-ev", "9.8", "--allow-nd-scene-drift",
-                                   "--nd-use", "all", "--aux")
-    close(report["nd"]["scene_drift_ev"], -1)
-    assert report["nd"]["method"] == "manual" and supplied["frames"][130 * 256 + 130] == 3
-    assert supplied["frames"][130 * 256 + 242] == 1
+    auto, _ = fuse("nd-auto-drift", "--groups", nd_groups([filter_frame, drift]))
+    assert any("scene drift" in w for w in auto["warnings"])
+    report, _ = fuse("nd-manual", "--groups", nd_groups([filter_frame, drift], 9.8), "--allow-scene-drift")
+    close(report["groups"][1]["calibration"]["scene_drift_ev"], -1)
+    assert report["groups"][1]["calibration"]["method"] == "manual"
+    assert any("scene drift" in w for w in report["warnings"])
+    fuse("drift-without-manual-ev", "--groups", nd_groups([filter_frame, drift]), "--allow-scene-drift",
+         error="--allow-scene-drift requires a group with a manual ev and a drift_mask")
 
 
     def write_mask(name, width, selected):
@@ -458,14 +487,18 @@ def main(exe, folder):
     dng(nd_frame, (1, 10), lambda y, x, c: 0.6 / math.exp2(group_evs[c]) if 69 <= x < 78 else 0.1)
     blocked_valid = write_mask("base-valid", SIZE, lambda x: x < 48 or 85 <= x < 100)
     open_contribution = write_mask("open-contribution", SIZE, lambda x: 42 <= x < 96)
-    nd_valid = write_mask("nd-valid", SIZE, lambda x: 69 <= x)
+    open_valid = write_mask("open-valid", SIZE, lambda x: x < 100)
+    nd_valid = write_mask("nd-valid", SIZE, lambda x: 69 <= x < 78)
     nd_patch = write_mask("nd-patch", SIZE, lambda x: 56 <= x < 78)
     manifest = folder / "groups.json"
+    # The brackets read deliberately different levels to show which one wins, so
+    # offset matching (tested separately) is off.
     entries = [
         {"name": "base", "frames": [base_frame.name], "valid_mask": blocked_valid},
-        {"name": "clear", "frames": [open_frame.name], "contribution_mask": open_contribution},
+        {"name": "clear", "frames": [open_frame.name], "valid_mask": open_valid,
+         "contribution_mask": open_contribution, "match": "none"},
         {"name": "filter", "frames": [nd_frame.name], "valid_mask": nd_valid,
-         "contribution_mask": nd_patch, "ev": list(group_evs)},
+         "contribution_mask": nd_patch, "ev": list(group_evs), "match": "none"},
     ]
     manifest.write_text(json.dumps({"groups": entries}))
     mosaic = folder / "groups-cfa.exr"
@@ -490,6 +523,7 @@ def main(exe, folder):
     assert composed["source"][row + 73] == 3
     assert composed["source"][row + 108] == 0
     assert composed["flags"][row + 82] & 1
+    assert composed["flags"][row + 73] & 32  # Replaces a higher clipping bound, flagged.
     assert composed["flags"][row + 108] == 16 | 256
     _, cfa_data = read_exr(mosaic)
     assert [cfa_data["source"][row + x] for x in (20, 42, 60, 73, 82, 108)] == [1, 2, 2, 3, 2, 0]
@@ -507,12 +541,13 @@ def main(exe, folder):
     filtered = write_mask("nd-filter-valid", 256, lambda x: x < 224)
     replacement = write_mask("nd-only-highlight", 256, lambda x: 196 <= x < 224)
     clear_patch = write_mask("clear-only-highlight", 256, lambda x: 190 <= x < 224)
+    # The first group is unrelated to the scene, so offset matching against it is off.
     entries = [
         {"name": "base", "frames": [fake_base.name]},
         {"name": "filter", "frames": [filter_frame.name], "contribution_mask": replacement,
          "ev": "auto", "calibration_reference": "clear", "calibration_mask": calibration,
-         "valid_mask": filtered},
-        {"name": "clear", "frames": [base.name], "contribution_mask": clear_patch},
+         "valid_mask": filtered, "match": "none"},
+        {"name": "clear", "frames": [base.name], "contribution_mask": clear_patch, "match": "none"},
     ]
     manifest.write_text(json.dumps({"groups": entries}))
     report, (_, composed) = fuse("group-auto", "--groups", manifest, "--aux")
@@ -524,7 +559,7 @@ def main(exe, folder):
     assert report["groups"][1]["calibration"]["scene_drift_samples"] == 0
     entries[1]["calibration_mask"] = replacement
     manifest.write_text(json.dumps({"groups": entries}))
-    fuse("group-auto-empty", "--groups", manifest, error="filter: insufficient ND overlap")
+    fuse("group-auto-empty", "--groups", manifest, error="filter: insufficient overlap")
 
 
 if __name__ == "__main__":

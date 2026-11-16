@@ -11,32 +11,47 @@ namespace {
 
 constexpr int blockSize = 64;
 constexpr size_t minimumSamples = 2000;
+// The reference merge needs SNR ≥ 10 at a calibration site. An attenuated sample
+// is selected by the signal the reference predicts for it (SNR ≥ 5), not by its
+// own noisy reading, which would favour samples that happened to read high.
+// Thousands of such samples still give a median to about 0.01 EV. Drift samples
+// need SNR ≥ 5, because thousands of them still reveal a large scene change.
+constexpr double referenceVariance = 0.01, sampleVariance = 0.04, driftVariance = 0.04;
 struct Samples {
     std::array<std::vector<float>, 3> ev;
     std::vector<float> drift;
 };
 
-std::string overlapError(const std::vector<RawFrame>& plain, const std::vector<RawFrame>& nd,
-                         const NDResult& estimate, const Options& o) {
-    const double shortestPlain = plain.front().effective;
-    const double longestND = nd.back().effective;
-    const double overlapEv = std::log2(longestND * o.high / (shortestPlain * o.ndMinSignal));
+std::string seconds(double value) {
+    std::ostringstream text;
+    if (value < 0.5) text << "1/" << std::setprecision(4) << 1 / value << " s";
+    else text << std::setprecision(3) << value << " s";
+    return text.str();
+}
+
+std::string overlapError(const std::vector<RawFrame>& reference, const std::vector<RawFrame>& filtered,
+                         const NDResult& estimate) {
     std::ostringstream message;
-    message << "insufficient ND overlap (R/G/B " << estimate.samples[0] << '/' << estimate.samples[1]
-            << '/' << estimate.samples[2] << " inliers; need " << minimumSamples << " per colour). "
-            << "Longest ND exposure is " << nd.back().metadata.exposure
-            << " s, shortest plain exposure is " << plain.front().metadata.exposure
-            << " s. The exposure windows can overlap up to " << std::fixed << std::setprecision(2)
-            << overlapEv << " EV of attenuation. Capture a longer ND exposure with usable scene overlap "
-            << (o.groups.empty() ? "or supply --nd-ev EV" : "or supply a measured ev for this group");
-    double measured = -1;
-    for (double ev : estimate.measured) if (std::isfinite(ev)) measured = std::max(measured, ev);
-    if (measured >= 0) {
-        const double required = shortestPlain * std::exp2(measured) * o.ndMinSignal / o.high;
-        message << ". At the strongest measured channel (" << measured << " EV), overlap requires at least "
-                << std::defaultfloat << std::setprecision(3)
-                << required * nd.back().metadata.seconds / longestND << " s at this ND ISO/aperture";
+    message << "insufficient overlap with the calibration reference (R/G/B " << estimate.samples[0] << '/'
+            << estimate.samples[1] << '/' << estimate.samples[2] << " usable sites; need " << minimumSamples
+            << " per colour). A usable site is unclipped with SNR of at least 10 in the reference merge, "
+               "and an attenuated frame records it unclipped with a predicted SNR of at least 5";
+    double strongest = -1;
+    for (int c = 0; c < 3; ++c)
+        if (estimate.samples[c] >= 50) strongest = std::max(strongest, estimate.measured[c]);
+    if (strongest >= 0) {
+        // The longest attenuated frame records what this unattenuated exposure would.
+        const double equivalent = filtered.back().effective * std::exp2(-strongest);
+        const double gap = std::log2(reference.front().effective / equivalent);
+        message << ". At the measured " << std::fixed << std::setprecision(2) << strongest
+                << " EV, the longest attenuated frame equals an unattenuated " << seconds(equivalent)
+                << ", " << std::fabs(gap) << " EV " << (gap > 0 ? "darker than" : "brighter than")
+                << " the shortest reference frame (" << seconds(reference.front().effective) << ")";
+        if (gap > 0) message << "; the brackets do not overlap, so extend the attenuated bracket or "
+                                "shorten the reference bracket by at least that much";
+        else message << "; the brackets overlap, but too little of the scene falls in the shared range";
     }
+    message << ". Widen the calibration_mask or set a measured ev for this group";
     return message.str();
 }
 
@@ -45,23 +60,29 @@ double floatMedian(const std::vector<float>& input) {
     return median(values);
 }
 
+double relativeVariance(const RawFrame& frame, int colour, double fraction, double extra) {
+    const auto noise = frame.noise[colour];
+    return (noise.shot * fraction + noise.read + extra) / (fraction * fraction);
+}
+
 } // namespace
 
-NDResult calibrateND(const MergeResult& plainMerge, const std::vector<RawFrame>& plain,
-                     const std::vector<RawFrame>& nd, const Mask& coverage,
-                     const std::optional<RGB>& manualEV, bool checkUncovered,
-                     const Options& o, Warnings& warnings) {
-    const auto& layout = plain.front().layout;
+NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& reference,
+                     const std::vector<RawFrame>& filtered, const Mask& calibration, const Mask& drift,
+                     const std::optional<RGB>& manualEV, const Options& o, Warnings& warnings) {
+    const auto& layout = reference.front().layout;
     const int across = (layout.width + blockSize - 1) / blockSize;
     const int down = (layout.height + blockSize - 1) / blockSize;
-    auto behindFilter = [&](size_t i) { return coverage.empty() || coverage[i]; };
+    const bool checkDrift = !drift.empty();
     // Odd stride samples every Bayer phase while keeping the overlap pool bounded on large images.
     int stride = 1;
     constexpr size_t sampleBudget = 4'000'000;
-    while (double(layout.size()) * nd.size() / (double(stride) * stride) > sampleBudget &&
+    while (double(layout.size()) * filtered.size() / (double(stride) * stride) > sampleBudget &&
            stride < 7) stride += 2;
     std::vector<Samples> blocks(size_t(across) * down);
-    auto gather = [&](int stride, const std::array<bool, 3>& include, bool collectDrift) {
+    // Without `predicted` attenuation, samples are selected by their own reading for a first estimate.
+    auto gather = [&](int stride, const std::array<bool, 3>& include, bool collectDrift,
+                      const std::optional<RGB>& predicted) {
         parallelRows(down, o.threads, [&](int by) {
             for (int bx = 0; bx < across; ++bx) {
                 auto& block = blocks[size_t(by) * across + bx];
@@ -70,65 +91,78 @@ NDResult calibrateND(const MergeResult& plainMerge, const std::vector<RawFrame>&
                 for (int y = by * blockSize; y < std::min((by + 1) * blockSize, layout.height); y += stride) {
                     for (int x = bx * blockSize; x < std::min((bx + 1) * blockSize, layout.width); x += stride) {
                         const size_t i = layout.index(y, x);
-                        const auto& measurement = plainMerge.sites[i];
-                        const bool covered = behindFilter(i);
-                        if (covered ? !include[layout.colour(y, x)] : !collectDrift) continue;
-                        // Thousands of uncovered samples can reveal large scene changes
-                        // even when each comparison is less precise than an ND calibration sample.
-                        const double maxRelativeVariance = covered ? 0.0025 : 0.04;
-                        if (measurement.flags & (lowerBound | missing | moving | adjacentClipFallback) ||
-                            measurement.signal <= 0 ||
-                            measurement.variance >= maxRelativeVariance * measurement.signal * measurement.signal)
-                            continue;
-                        const float black = plain.front().black(y, x);
                         const int colour = layout.colour(y, x);
-                        for (const auto& frame : nd) {
-                            const auto s = sample(frame, y, x, i, black, o);
-                            const double minSignal = covered ? o.ndMinSignal : o.low;
-                            if (s.state != SampleState::usable || s.fraction <= 0 || s.fraction < minSignal)
-                                continue;
-                            if (!covered) {
-                                const auto noise = frame.noise[colour];
-                                const double variance = noise.shot * s.fraction + noise.read + s.extra;
-                                if (variance >= maxRelativeVariance * s.fraction * s.fraction) continue;
-                            }
-                            const float ev = float(std::log2(frame.effective * measurement.signal / s.fraction));
-                            if (covered) {
+                        const bool covered = calibration.empty() || calibration[i];
+                        const bool unfiltered = collectDrift && drift[i];
+                        if (!(covered && include[colour]) && !unfiltered) continue;
+                        const auto& measurement = merged.sites[i];
+                        if (measurement.flags & (lowerBound | missing | moving | adjacentClipFallback) ||
+                            measurement.signal <= 0)
+                            continue;
+                        const double reliable = measurement.variance /
+                                                (double(measurement.signal) * measurement.signal);
+                        if (covered && include[colour] && reliable < referenceVariance) {
+                            for (const auto& frame : filtered) {
+                                const auto s = sample(frame, y, x, i, o);
+                                if (s.state != SampleState::usable || s.fraction <= 0) continue;
+                                const double expected = predicted ?
+                                    frame.effective * measurement.signal * std::exp2(-(*predicted)[colour]) : s.fraction;
+                                if (expected < o.low || expected > 0.8 * o.high ||
+                                    relativeVariance(frame, colour, expected, s.extra) >= sampleVariance)
+                                    continue;
                                 constexpr size_t maxBlockSamples = 2048;
                                 auto& values = block.ev[colour];
-                                if (values.size() < maxBlockSamples) values.push_back(ev);
+                                if (values.size() < maxBlockSamples)
+                                    values.push_back(float(std::log2(frame.effective * measurement.signal / s.fraction)));
                             }
-                            else block.drift.push_back(-ev);
+                        }
+                        if (unfiltered && reliable < driftVariance) {
+                            // Drift sites lie outside the group's validity, so read them directly.
+                            for (const auto& frame : filtered) {
+                                if (frame.rejected[i] & excluded) continue;
+                                const float black = frame.black(y, x);
+                                const double full = frame.white - black;
+                                const double raw = frame.raw(y, x);
+                                if (raw >= frame.white - o.clipMargin * full) continue;
+                                const double fraction = (raw - black) / full;
+                                if (fraction < o.low || fraction > o.high ||
+                                    relativeVariance(frame, colour, fraction, 0) >= driftVariance)
+                                    continue;
+                                block.drift.push_back(float(std::log2(fraction / (frame.effective * measurement.signal))));
+                            }
                         }
                     }
                 }
             }
         });
     };
-    gather(stride, {true, true, true}, checkUncovered);
+    gather(stride, {true, true, true}, checkDrift, std::nullopt);
 
     NDResult result;
     result.measured.fill(std::numeric_limits<double>::quiet_NaN());
     result.mad = result.measured;
-    std::vector<double> drift;
-    for (const auto& b : blocks) drift.insert(drift.end(), b.drift.begin(), b.drift.end());
-    if (checkUncovered && stride > 1 && !coverage.empty() && drift.size() < 100) {
-        gather(1, {}, true);
-        drift.clear();
-        for (const auto& b : blocks) drift.insert(drift.end(), b.drift.begin(), b.drift.end());
+    std::vector<double> changes;
+    for (const auto& b : blocks) changes.insert(changes.end(), b.drift.begin(), b.drift.end());
+    if (checkDrift && stride > 1 && changes.size() < 100) {
+        gather(1, {}, true, std::nullopt);
+        changes.clear();
+        for (const auto& b : blocks) changes.insert(changes.end(), b.drift.begin(), b.drift.end());
     }
-    result.sceneDriftSamples = drift.size();
+    result.sceneDriftSamples = changes.size();
     std::string driftWarning;
-    if (drift.size() >= 100) {
-        result.sceneDrift = median(drift);
+    if (checkDrift && changes.size() < 100)
+        warnings.push_back("too few unfiltered samples (" + std::to_string(changes.size()) +
+                           ") to measure scene drift");
+    if (changes.size() >= 100) {
+        result.sceneDrift = median(changes);
         if (std::abs(*result.sceneDrift) > 0.2) {
             std::ostringstream message;
-            message << "ND scene drift of " << std::fixed << std::setprecision(2) << *result.sceneDrift
-                    << " EV exceeds 0.20 EV in the uncovered area";
+            message << "scene drift of " << std::fixed << std::setprecision(2) << *result.sceneDrift
+                    << " EV exceeds 0.20 EV in the unfiltered area";
             driftWarning = message.str();
-            if (manualEV && !o.allowNDSceneDrift)
+            if (manualEV && !o.allowSceneDrift)
                 throw std::runtime_error(driftWarning +
-                    "; capture matching sweeps or use --allow-nd-scene-drift with manual --nd-ev");
+                    "; capture matching brackets or pass --allow-scene-drift to keep the manual ev");
             warnings.push_back(driftWarning);
         }
     }
@@ -149,8 +183,8 @@ NDResult calibrateND(const MergeResult& plainMerge, const std::vector<RawFrame>&
                 return std::abs(value - centre) > cutoff;
             }), values.end());
             result.samples[c] = values.size();
+            if (!values.empty()) result.measured[c] = median(values);
             if (values.size() >= minimumSamples) {
-                result.measured[c] = median(values);
                 deviations.resize(values.size());
                 std::transform(values.begin(), values.end(), deviations.begin(),
                                [&](double value) { return std::abs(value - result.measured[c]); });
@@ -158,14 +192,28 @@ NDResult calibrateND(const MergeResult& plainMerge, const std::vector<RawFrame>&
             }
         }
     };
-    std::array<bool, 3> retry{};
-    for (int c = 0; c < 3; ++c) {
-        estimate(c);
-        retry[c] = result.samples[c] < minimumSamples;
+    // A first estimate from self-selected samples, then the final one from samples
+    // selected by their predicted signal.
+    RGB rough{};
+    for (int c = 0; c < 3; ++c) estimate(c);
+    {
+        std::vector<double> known;
+        for (int c = 0; c < 3; ++c) if (result.samples[c] >= 20) known.push_back(result.measured[c]);
+        const double fallback = known.empty() ? std::numeric_limits<double>::quiet_NaN() : median(known);
+        for (int c = 0; c < 3; ++c)
+            rough[c] = manualEV ? (*manualEV)[c] : result.samples[c] >= 20 ? result.measured[c] : fallback;
     }
-    if (stride > 1 && std::any_of(retry.begin(), retry.end(), [](bool value) { return value; })) {
-        gather(1, retry, false);
-        for (int c = 0; c < 3; ++c) if (retry[c]) estimate(c);
+    if (std::all_of(rough.begin(), rough.end(), [](double ev) { return std::isfinite(ev); })) {
+        gather(stride, {true, true, true}, false, rough);
+        std::array<bool, 3> retry{};
+        for (int c = 0; c < 3; ++c) {
+            estimate(c);
+            retry[c] = result.samples[c] < minimumSamples;
+        }
+        if (stride > 1 && std::any_of(retry.begin(), retry.end(), [](bool value) { return value; })) {
+            gather(1, retry, false, rough);
+            for (int c = 0; c < 3; ++c) if (retry[c]) estimate(c);
+        }
     }
     const bool enough = std::all_of(result.samples.begin(), result.samples.end(),
         [](size_t count) { return count >= minimumSamples; });
@@ -173,100 +221,42 @@ NDResult calibrateND(const MergeResult& plainMerge, const std::vector<RawFrame>&
     if (manualEV) {
         result.ev = *manualEV;
         for (int c = 0; c < 3; ++c)
-            if (std::isfinite(result.measured[c]) && std::abs(result.measured[c] - (*manualEV)[c]) > 0.2) {
-                warnings.push_back("measured ND strength differs from supplied ND EV by more than 0.2 EV");
+            if (result.samples[c] >= minimumSamples && std::abs(result.measured[c] - (*manualEV)[c]) > 0.2) {
+                warnings.push_back("measured attenuation differs from the supplied ev by more than 0.2 EV");
                 break;
             }
     } else {
         if (!enough) {
-            const auto error = overlapError(plain, nd, result, o);
+            const auto error = overlapError(reference, filtered, result);
             throw std::runtime_error(driftWarning.empty() ? error : error + ". " + driftWarning);
         }
         result.ev = result.measured;
         for (const double ev : result.ev)
             if (ev < -0.2 || ev > 64)
-                throw std::runtime_error("measured ND transmission is outside the expected range; check coverage and scene overlap");
+                throw std::runtime_error("measured attenuation is outside the expected range; check masks and scene overlap");
     }
+    for (int c = 0; c < 3; ++c)
+        if (result.samples[c] < minimumSamples) result.measured[c] = std::numeric_limits<double>::quiet_NaN();
 
-    result.rejectedBlocks.resize(blocks.size());
-    if (o.aux && o.groups.empty()) result.blockImage.assign(layout.size(), 0);
+    size_t flagged = 0;
     for (size_t i = 0; i < blocks.size(); ++i) {
         const auto& b = blocks[i];
         const size_t total = b.ev[0].size() + b.ev[1].size() + b.ev[2].size();
         if (total < 50) continue;
         BlockCheck block{int(i / across) * blockSize, int(i % across) * blockSize, {}, {}, false};
         block.ev.fill(std::numeric_limits<double>::quiet_NaN());
-        double deviation = 0;
         for (int c = 0; c < 3; ++c) {
             block.samples[c] = b.ev[c].size();
             if (b.ev[c].empty()) continue;
             block.ev[c] = floatMedian(b.ev[c]);
-            if (!std::isfinite(result.measured[c]) || block.samples[c] < 12) continue;
-            const double candidate = block.ev[c] - result.measured[c];
-            if (std::abs(candidate) > std::abs(deviation)) deviation = candidate;
+            if (block.samples[c] >= 12 && std::abs(block.ev[c] - result.ev[c]) > 0.25) block.flagged = true;
         }
-        block.removed = std::abs(deviation) > 0.25;
-        if (block.removed)
-            result.rejectedBlocks[i] = 1;
-        if (!result.blockImage.empty())
-            for (int y = block.row; y < std::min(block.row + blockSize, layout.height); ++y)
-                for (int x = block.col; x < std::min(block.col + blockSize, layout.width); ++x)
-                    if (behindFilter(layout.index(y, x))) result.blockImage[layout.index(y, x)] = float(deviation);
+        flagged += block.flagged;
         result.blocks.push_back(block);
     }
-    return result;
-}
-
-NDResult mergeND(MergeResult& plainMerge, const std::vector<RawFrame>& plain,
-                 const std::vector<RawFrame>& nd, const Mask& coverage, const Options& o,
-                 Warnings& warnings) {
-    const auto& layout = plain.front().layout;
-    const int across = (layout.width + blockSize - 1) / blockSize;
-    std::optional<RGB> manual;
-    if (o.ndEv) manual = RGB{*o.ndEv, *o.ndEv, *o.ndEv};
-    auto result = calibrateND(plainMerge, plain, nd, coverage, manual, !coverage.empty(), o, warnings);
-    const RGB transmission{std::exp2(-result.ev[0]), std::exp2(-result.ev[1]), std::exp2(-result.ev[2])};
-    const bool fillOnly = o.ndUse == "fill";
-    const std::vector<RawFrame> noPlain;
-    std::atomic<size_t> blocked{0};
-    std::atomic<int64_t> shadowDelta{0};
-    parallelRows(layout.height, o.threads, [&](int y) {
-        size_t blockedRow = 0;
-        int shadowRowDelta = 0;
-        for (int x = 0; x < layout.width; ++x) {
-            const size_t i = layout.index(y, x);
-            auto& site = plainMerge.sites[i];
-            if (!coverage.empty() && !coverage[i]) continue;
-            if ((fillOnly && !(site.flags & lowerBound)) || (!fillOnly && (site.flags & moving)))
-                continue;
-            if (result.rejectedBlocks[size_t(y / blockSize) * across + x / blockSize]) {
-                blockedRow += (site.flags & lowerBound) != 0;
-                continue;
-            }
-            const auto merged = mergeSite(fillOnly ? noPlain : plain, &nd, transmission, y, x, o);
-            auto replacement = merged.site;
-            if (!(replacement.flags & fromND)) continue;
-            if (site.flags & lowerBound) {
-                if (replacement.flags & adjacentClipFallback) continue;
-                if (!(replacement.flags & lowerBound) && replacement.signal < 0.9f * site.signal) {
-                    site.flags |= ndInconsistent;
-                    continue;
-                }
-                if ((replacement.flags & lowerBound) && replacement.signal <= site.signal) continue;
-                replacement.signal = std::max(replacement.signal, site.signal);
-            }
-            replacement.flags |= site.flags & moving;
-            site = replacement;
-            if (!plainMerge.shadowSites.empty()) {
-                shadowRowDelta += int(merged.shadow) - int(plainMerge.shadowSites[i]);
-                plainMerge.shadowSites[i] = merged.shadow;
-            }
-        }
-        blocked.fetch_add(blockedRow, std::memory_order_relaxed);
-        shadowDelta.fetch_add(shadowRowDelta, std::memory_order_relaxed);
-    });
-    result.blockedLowerBounds = blocked;
-    plainMerge.shadow = size_t(int64_t(plainMerge.shadow) + shadowDelta.load());
+    if (flagged)
+        warnings.push_back(std::to_string(flagged) + " calibration blocks differ from the group's ev by more "
+                           "than 0.25 EV (glare, filter edge or scene change); see blocks_flagged");
     return result;
 }
 }

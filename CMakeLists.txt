@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(rawfuse VERSION 0.2.2 LANGUAGES CXX)
+project(rawfuse VERSION 0.3.0 LANGUAGES CXX)
 
 include(CTest)
 include(GNUInstallDirs)
@@ -16,7 +16,7 @@ find_package(Threads REQUIRED)
 
 add_library(rawfuse_pipeline STATIC
     src/options.cpp src/metadata.cpp src/raw_frame.cpp src/dark_model.cpp src/merge.cpp
-    src/nd.cpp src/groups.cpp src/finish.cpp src/colour.cpp src/writer.cpp src/pipeline.cpp)
+    src/bracket.cpp src/nd.cpp src/groups.cpp src/finish.cpp src/colour.cpp src/writer.cpp src/pipeline.cpp)
 target_compile_features(rawfuse_pipeline PUBLIC cxx_std_17)
 target_compile_definitions(rawfuse_pipeline PUBLIC RAWFUSE_VERSION="${PROJECT_VERSION}")
 target_link_libraries(rawfuse_pipeline PRIVATE

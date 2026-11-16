@@ -204,6 +204,39 @@ void markDefects(RawFrame& frame, const Options& options, const std::vector<BadP
     }
 }
 
+// Robust spread of LibRaw's masked (optical black) areas outside the active grid,
+// measured around each Bayer phase's own median. Returns 0 without enough pixels.
+double opticalBlackSigma(const LibRaw& raw, const RawFrame& frame) {
+    const auto& sizes = raw.imgdata.sizes;
+    const auto* data = raw.imgdata.rawdata.raw_image;
+    std::array<std::vector<double>, 4> phases;
+    constexpr size_t cap = 1'000'000;
+    for (const auto& area : sizes.mask) {
+        // Skip a few pixels at each edge, where masked areas often ramp.
+        const int top = area[0] + 4, left = area[1] + 4, bottom = area[2] - 4, right = area[3] - 4;
+        if (top < 0 || left < 0 || top >= bottom || left >= right ||
+            bottom > frame.rawHeight || right > frame.rawWidth)
+            continue;
+        if (top < frame.top + frame.layout.height && bottom > frame.top &&
+            left < frame.left + frame.layout.width && right > frame.left)
+            continue;
+        for (int y = top; y < bottom; ++y)
+            for (int x = left; x < right; ++x) {
+                auto& values = phases[(y & 1) * 2 + (x & 1)];
+                if (values.size() < cap) values.push_back(data[size_t(y) * frame.stride + x]);
+            }
+    }
+    std::vector<double> deviations;
+    for (auto& values : phases) {
+        if (values.empty()) continue;
+        auto copy = values;
+        const double centre = median(copy);
+        for (double value : values) deviations.push_back(value - centre);
+    }
+    if (deviations.size() < 10000) return 0;
+    return std::sqrt(robustVariance(std::move(deviations)));
+}
+
 } // namespace
 
 std::string Layout::pattern() const {
@@ -344,6 +377,7 @@ RawFrame readRaw(const fs::path& path, Warnings& warnings) {
             for (int j = 0; j < 3; ++j)
                 frame.cameraToSRGB[i][m.planeColours[j]] = c.rgb_cam[i][j];
 
+        frame.opticalBlackSigma = opticalBlackSigma(*raw, frame);
         frame.mosaic = raw->imgdata.rawdata.raw_image + size_t(frame.top) * frame.stride + frame.left;
         frame.mosaicOwner = std::move(raw);
         for (const auto& warning : local) warnings.push_back(path.filename().string() + ": " + warning);
@@ -359,11 +393,18 @@ double validateFrames(const FrameGroups& groups, Warnings& warnings) {
         return frame.layout.width == first.layout.width && frame.layout.height == first.layout.height &&
                frame.top == first.top && frame.left == first.left && frame.rawWidth == first.rawWidth &&
                frame.rawHeight == first.rawHeight && frame.layout.cfa == first.layout.cfa &&
-               frame.make == first.make && frame.model == first.model && frame.white == first.white &&
-               frame.blackRows == first.blackRows && frame.blackCols == first.blackCols &&
-               frame.blackPattern == first.blackPattern && frame.blackDeltaRows == first.blackDeltaRows &&
-               frame.blackDeltaCols == first.blackDeltaCols;
+               frame.make == first.make && frame.model == first.model;
     };
+    // Black and white levels may legitimately differ per frame: LibRaw measures
+    // some cameras' black level from each frame's masked pixels. Every sample
+    // uses its own frame's levels; only report differences beyond small jitter.
+    auto meanBlack = [](const RawFrame& frame) {
+        double sum = 0;
+        for (float value : frame.blackPattern) sum += value;
+        return sum / double(frame.blackPattern.size());
+    };
+    const double firstBlack = meanBlack(first);
+    double blackSpread = 0, whiteSpread = 0;
     double aperture = 1;
     for (const auto& frame : *groups.front())
         if (std::isfinite(frame.metadata.aperture) && frame.metadata.aperture > 0) {
@@ -371,15 +412,15 @@ double validateFrames(const FrameGroups& groups, Warnings& warnings) {
             break;
         }
     const double firstISO = first.metadata.iso > 0 ? first.metadata.iso : 100;
-    bool isoDiffers = false, nominal = true;
-    size_t frames = 0;
+    bool isoDiffers = false;
     size_t baselineFrames = 0;
     for (auto* group : groups) {
         for (auto& frame : *group) {
-            ++frames;
             auto& meta = frame.metadata;
             if (!same(frame))
-                throw std::runtime_error(frame.path.string() + ": camera, CFA, active area or black/white levels differ");
+                throw std::runtime_error(frame.path.string() + ": camera, CFA or active area differ");
+            blackSpread = std::max(blackSpread, std::abs(meanBlack(frame) - firstBlack));
+            whiteSpread = std::max(whiteSpread, double(std::abs(frame.white - first.white)));
             if (!std::isfinite(meta.iso) || meta.iso <= 0) {
                 warnings.push_back(frame.path.filename().string() + ": no ISO; assuming 100");
                 meta.iso = 100;
@@ -392,18 +433,22 @@ double validateFrames(const FrameGroups& groups, Warnings& warnings) {
             frame.effective = meta.seconds * (meta.iso / 100) * ratio * ratio;
             if (!(frame.effective > 0) || !std::isfinite(frame.effective))
                 throw std::runtime_error(frame.path.string() + ": invalid effective exposure");
+            frame.exifEffective = frame.effective;
             isoDiffers |= meta.iso != firstISO;
             baselineFrames += meta.baseline != 0;
-            const double reciprocal = 1 / meta.seconds;
-            nominal &= meta.seconds <= 1 && std::abs(reciprocal - std::round(reciprocal)) < 1e-8;
         }
+    }
+    const double tolerance = 0.001 * (first.white - firstBlack);
+    if (blackSpread > tolerance || whiteSpread > tolerance) {
+        std::ostringstream message;
+        message << "black or white levels differ between frames (up to " << blackSpread << " / "
+                << whiteSpread << " DN); using each frame's own levels";
+        warnings.push_back(message.str());
     }
     if (baselineFrames)
         warnings.push_back("BaselineExposure is recorded without applying it (" +
                            std::to_string(baselineFrames) + " input frames)");
     if (isoDiffers) warnings.push_back("ISO differs between frames; using each frame's reported ISO and noise");
-    if (nominal && frames > 1)
-        warnings.push_back("all exposures are exact 1/N; check whether the camera used nominal shutter times");
     return aperture;
 }
 
@@ -415,11 +460,8 @@ Sidecars loadSidecars(const Options& o, const Layout& layout) {
         result.valid.push_back(readMask(group.validMask, layout));
         result.contribution.push_back(readMask(group.contributionMask, layout));
         result.calibration.push_back(readMask(group.calibrationMask, layout));
+        result.drift.push_back(readMask(group.driftMask, layout));
     }
-    result.ndCoverage = readMask(o.ndMask, layout);
-    if (!o.ndMask.empty() &&
-        std::none_of(result.ndCoverage.begin(), result.ndCoverage.end(), [](auto v) { return v != 0; }))
-        throw std::runtime_error("ND mask has no covered Bayer sites");
     if (o.vignette != "dng" && o.vignette != "none") {
         const int channels = imageChannels(o.vignette, layout);
         if (channels != 1 && channels != 3)
@@ -437,56 +479,49 @@ void releaseMosaics(std::vector<RawFrame>& frames) {
     }
 }
 
-std::vector<DarkFit> prepareFrames(const FrameGroups& groups, const Sidecars& sidecars,
-                                   const Options& o, Warnings& warnings) {
+Preparation prepareFrames(const FrameGroups& groups, const Sidecars& sidecars,
+                          const Options& o, Warnings& warnings) {
     const auto& model = sidecars.darkModel;
     const auto& bad = sidecars.badPixels;
-    const auto& override = o.noiseOverride;
     std::vector<uint8_t> horizontal;
-    bool fallback = false;
     size_t undated = 0;
-    std::vector<DarkFit> fits(groups.size());
+    Preparation result;
+    result.darkFits.resize(groups.size());
+    result.exposureSteps.resize(groups.size());
     for (size_t g = 0; g < groups.size(); ++g) {
         const Mask empty;
         const auto& validity = sidecars.valid.empty() ? empty : sidecars.valid[g];
         for (auto& frame : *groups[g]) {
-            const auto& profile = override.empty() ? frame.metadata.noise : override;
-            if (profile.empty()) fallback = true;
-            else if (profile.size() != 2 && profile.size() != 6)
-                throw std::runtime_error(frame.path.string() + ": expected one or three NoiseProfile pairs");
-            for (size_t c = 0; c < 3; ++c) {
-                const size_t index = profile.size() == 6 ? 2 * c : 0;
-                auto& noise = frame.noise[c];
-                noise = profile.empty() ? Noise{0.001, 0.000001} : Noise{profile[index], profile[index + 1]};
-                if (noise.shot < 0 || noise.read < 0 || (noise.shot == 0 && noise.read == 0))
-                    throw std::runtime_error("noise coefficients must be nonnegative and include a positive term");
-            }
             markClipping(frame, o, horizontal, validity);
             markDefects(frame, o, bad, model);
             undated += frame.undatedDefects != 0;
             for (size_t i = 0; i < validity.size(); ++i)
                 if (!validity[i]) frame.rejected[i] |= outsideValidity;
         }
-        if (!o.darkModel.empty() && !groups[g]->empty()) {
-            fits[g] = fitDarkModel(*groups[g], model, o);
-            if (fits[g].method == "unavailable") {
-                const std::string name = o.groups.empty() ? (g ? "ND" : "plain") : o.groups[g].name;
-                warnings.push_back(name +
-                    " sweep has too few usable dark-model sites to fit; treating model sites as missing");
-            }
-        }
+    }
+    // Exposure ratios first: the noise fit compares frames at their true ratios.
+    auto byExposure = [](const RawFrame& a, const RawFrame& b) { return a.effective < b.effective; };
+    result.exposureSteps = measureExposures(groups, o, warnings);
+    for (auto* group : groups) std::stable_sort(group->begin(), group->end(), byExposure);
+    result.noiseFits = assignNoise(groups, o, warnings);
+    for (size_t g = 0; g < groups.size(); ++g) {
+        if (o.darkModel.empty() || groups[g]->empty()) continue;
+        result.darkFits[g] = fitDarkModel(*groups[g], model, o);
+        if (result.darkFits[g].method == "unavailable")
+            warnings.push_back(o.groups[g].name +
+                " sweep has too few usable dark-model sites to fit; treating model sites as missing");
     }
     if (undated)
         warnings.push_back(std::to_string(undated) + " input frames have no capture time; "
                            "excluding every dated bad-pixel list entry");
-    if (fallback) warnings.push_back("missing NoiseProfile for one or more frames; using S=0.001, O=0.000001 for those frames");
-    return fits;
+    return result;
 }
 
-Sample sample(const RawFrame& frame, int row, int col, size_t index, float black, const Options& o) {
+Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
     const auto mask = frame.rejected[index];
     if (mask & (excluded | outsideValidity)) return {SampleState::missing};
     if (mask & saturated) return {SampleState::clipped};
+    const float black = frame.black(row, col);
     const double full = frame.white - black;
     double dark = 0, extra = 0;
     if (mask & modeled) {

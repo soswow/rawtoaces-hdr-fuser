@@ -10,7 +10,6 @@ struct Measurement {
     const RawFrame* frame;
     double exposure;
     float fraction, extra;
-    bool nd;
 };
 
 double variance(const Noise& noise, double fraction, double extra) {
@@ -20,7 +19,7 @@ double variance(const Noise& noise, double fraction, double extra) {
 Site one(const Measurement& m, int colour) {
     const double rate = m.fraction / m.exposure;
     const double var = variance(m.frame->noise[colour], m.fraction, m.extra) / (m.exposure * m.exposure);
-    return {float(rate), float(var), uint16_t(m.nd ? fromND : 0), 1};
+    return {float(rate), float(var), 0, 1};
 }
 
 double quad(const RawFrame& frame, int row, int col, const Options& o) {
@@ -28,7 +27,7 @@ double quad(const RawFrame& frame, int row, int col, const Options& o) {
     double sum = 0;
     for (int y = row; y < row + 2; ++y) {
         for (int x = col; x < col + 2; ++x) {
-            const auto s = sample(frame, y, x, layout.index(y, x), frame.black(y, x), o);
+            const auto s = sample(frame, y, x, layout.index(y, x), o);
             if (s.state != SampleState::usable || s.fraction < o.low) return 0;
             sum += s.fraction;
         }
@@ -61,43 +60,32 @@ size_t findReference(const std::vector<RawFrame>& frames, const Options& o) {
 
 } // namespace
 
-SiteMerge mergeSite(const std::vector<RawFrame>& plain, const std::vector<RawFrame>* nd,
-                    RGB transmission, int row, int col, const Options& o) {
-    const auto& first = (plain.empty() ? *nd : plain).front();
+SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const Options& o) {
+    const auto& first = frames.front();
     const int colour = first.layout.colour(row, col);
     const size_t index = first.layout.index(row, col);
-    const float black = first.black(row, col);
     double seed = 0, seedWeight = 0;
     double boundExposure = std::numeric_limits<double>::infinity();
-    bool boundFromND = false;
     std::optional<Measurement> aboveHigh, adjacent;
     size_t longest = 0;
     thread_local std::vector<Measurement> usable;
     usable.clear();
-    usable.reserve(plain.size() + (nd ? nd->size() : 0));
-    auto collect = [&](const std::vector<RawFrame>& frames, double tau, bool isND) {
-        for (const auto& frame : frames) {
-            const auto s = sample(frame, row, col, index, black, o);
-            const double exposure = frame.effective * tau;
-            if (s.state == SampleState::clipped && exposure < boundExposure) {
-                boundExposure = exposure;
-                boundFromND = isND;
-            }
-            if (s.state == SampleState::aboveHigh && (!aboveHigh || exposure < aboveHigh->exposure))
-                aboveHigh = {&frame, exposure, s.fraction, s.extra, isND};
-            if (s.state == SampleState::adjacentClip &&
-                (!adjacent || exposure < adjacent->exposure))
-                adjacent = {&frame, exposure, s.fraction, s.extra, isND};
-            if (s.state != SampleState::usable) continue;
-            usable.push_back({&frame, exposure, s.fraction, s.extra, isND});
-            const double weight = std::max(0.0, std::min(s.fraction - o.low, o.high - s.fraction));
-            seed += weight * s.fraction / exposure;
-            seedWeight += weight;
-            if (usable.size() == 1 || exposure > usable[longest].exposure) longest = usable.size() - 1;
-        }
-    };
-    collect(plain, 1, false);
-    if (nd) collect(*nd, transmission[colour], true);
+    usable.reserve(frames.size());
+    for (const auto& frame : frames) {
+        const auto s = sample(frame, row, col, index, o);
+        const double exposure = frame.effective;
+        if (s.state == SampleState::clipped && exposure < boundExposure) boundExposure = exposure;
+        if (s.state == SampleState::aboveHigh && (!aboveHigh || exposure < aboveHigh->exposure))
+            aboveHigh = {&frame, exposure, s.fraction, s.extra};
+        if (s.state == SampleState::adjacentClip && (!adjacent || exposure < adjacent->exposure))
+            adjacent = {&frame, exposure, s.fraction, s.extra};
+        if (s.state != SampleState::usable) continue;
+        usable.push_back({&frame, exposure, s.fraction, s.extra});
+        const double weight = std::max(0.0, std::min(s.fraction - o.low, o.high - s.fraction));
+        seed += weight * s.fraction / exposure;
+        seedWeight += weight;
+        if (usable.size() == 1 || exposure > usable[longest].exposure) longest = usable.size() - 1;
+    }
     if (usable.empty()) {
         if (aboveHigh) return {one(*aboveHigh, colour), false};
         if (adjacent) {
@@ -105,8 +93,7 @@ SiteMerge mergeSite(const std::vector<RawFrame>& plain, const std::vector<RawFra
             fallback.flags |= adjacentClipFallback;
             return {fallback, adjacent->fraction < o.low};
         }
-        if (std::isfinite(boundExposure))
-            return {{float(1 / boundExposure), 0, uint16_t(lowerBound | (boundFromND ? fromND : 0)), 0}, false};
+        if (std::isfinite(boundExposure)) return {{float(1 / boundExposure), 0, lowerBound, 0}, false};
         return {{0, 0, missing, 0}, false};
     }
     if (usable.size() == 1)
@@ -114,17 +101,15 @@ SiteMerge mergeSite(const std::vector<RawFrame>& plain, const std::vector<RawFra
     const auto& reach = usable[longest];
     seed = std::max(0.0, seedWeight > 0 ? seed / seedWeight : reach.fraction / reach.exposure);
     double sum = 0, total = 0;
-    bool shadow = true, usesND = false;
+    bool shadow = true;
     for (const auto& m : usable) {
         const auto noise = m.frame->noise[colour];
         const double scaledWeight = m.exposure / variance(noise, seed * m.exposure, m.extra);
         sum += scaledWeight * m.fraction;
         total += scaledWeight * m.exposure;
         shadow &= m.fraction < o.low;
-        usesND |= m.nd;
     }
-    return {{float(sum / total), float(1 / total), uint16_t(usesND ? fromND : 0),
-             uint16_t(usable.size())}, shadow};
+    return {{float(sum / total), float(1 / total), 0, uint16_t(usable.size())}, shadow};
 }
 
 MergeResult mergePlain(const std::vector<RawFrame>& frames, const Options& o, const Mask& selection,
@@ -172,16 +157,16 @@ MergeResult mergePlain(const std::vector<RawFrame>& frames, const Options& o, co
             }
             const bool isMoving = !motion.empty() && nearMotion(row, col);
             if (isMoving) {
-                const auto s = sample(ref, row, col, index, ref.black(row, col), o);
+                const auto s = sample(ref, row, col, index, o);
                 if (s.state == SampleState::usable) {
-                    result.sites[index] = one({&ref, ref.effective, s.fraction, s.extra, false}, layout.colour(row, col));
+                    result.sites[index] = one({&ref, ref.effective, s.fraction, s.extra}, layout.colour(row, col));
                     result.sites[index].flags |= moving;
                     shadows += s.fraction < o.low;
                     if (trackShadow) result.shadowSites[index] = s.fraction < o.low;
                     continue;
                 }
             }
-            auto value = mergeSite(frames, nullptr, unitWB, row, col, o);
+            auto value = mergeSite(frames, row, col, o);
             if (isMoving) value.site.flags |= moving;
             result.sites[index] = value.site;
             shadows += value.shadow;

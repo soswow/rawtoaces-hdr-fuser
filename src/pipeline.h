@@ -27,29 +27,29 @@ constexpr Matrix identity{{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
 struct InputGroup {
     std::string name, calibrationReference;
     std::vector<fs::path> files;
-    fs::path validMask, contributionMask, calibrationMask;
+    fs::path validMask, contributionMask, calibrationMask, driftMask;
     std::optional<RGB> ev;
     bool autoEV = false;
+    bool matchOffset = true;  // "match": "offset" (default) or "none"
 };
 
 struct Options {
-    std::vector<fs::path> plain, nd;
+    std::vector<fs::path> plain;  // Positional frames; parsed into a single group
     fs::path manifest;
     std::vector<InputGroup> groups;
-    fs::path output, report, writeCfa, darkModel, ndMask;
+    fs::path output, report, writeCfa, darkModel;
     std::string space = "aces", wb = "median", matrix = "metadata";
-    std::string normalize = "geomean", badPixels = "dng", noise = "dng";
+    std::string normalize = "geomean", badPixels = "dng", noise = "auto";
+    std::string exposures = "measured";
     std::optional<Matrix> customMatrix;  // Parsed --matrix custom:FILE
     std::string vignette = "dng", highlights = "neutral", demosaic = "bilinear";
-    std::string ndUse = "fill";
-    std::optional<double> ndEv;
     double outputFloor = 0;
     int reference = 0, clipDilate = 1;
     unsigned threads = 1;
     double deghostEv = 1, darkModelError = 0.10, low = 0.0083, high = 0.88;
-    double clipMargin = 0.001, ndMinSignal = 0.05;
+    double clipMargin = 0.001;
     std::vector<double> noiseOverride;  // Parsed --noise S,O
-    bool deghost = true, aux = false, force = false, verbose = false, allowNDSceneDrift = false;
+    bool deghost = true, aux = false, force = false, verbose = false, quiet = false, allowSceneDrift = false;
 };
 
 struct Point { int row, col; };
@@ -98,8 +98,10 @@ struct RawFrame {
     int blackRows = 1, blackCols = 1;
     std::vector<float> blackPattern, blackDeltaRows, blackDeltaCols;
     float white = 0;
-    double effective = 0;
+    double effective = 0, exifEffective = 0;  // Measured (or EXIF) and EXIF-derived exposure
+    double opticalBlackSigma = 0;  // Robust DN spread of masked pixels; 0 when unavailable
     std::array<Noise, 3> noise{};
+    std::string noiseSource;
     RGB wb = unitWB;
     bool dng = false, hasWB = false;
     Matrix cameraToSRGB{};
@@ -142,14 +144,39 @@ struct BadPixel { Point site; long long since; };
 struct Sidecars {
     DarkModel darkModel;
     std::vector<BadPixel> badPixels;
-    std::vector<Mask> valid, contribution, calibration;  // Per input group
-    Mask ndCoverage;
+    std::vector<Mask> valid, contribution, calibration, drift;  // Per input group
 };
 Sidecars loadSidecars(const Options&, const Layout&);
-std::vector<DarkFit> prepareFrames(const FrameGroups&, const Sidecars&, const Options&, Warnings&);
+
+// Relative exposures measured between neighbouring frames of one group.
+struct ExposureStep {
+    size_t from = 0, to = 0;  // One-based input indices within the group
+    double exifRatio = 0, measuredRatio = 0, ratio = 0;  // ratio: the one used
+    double fromSeconds = 0, toSeconds = 0;
+    size_t samples = 0;
+    bool applied = false;      // measuredRatio is used
+    std::string borrowedFrom;  // Group whose measurement for the same settings is used
+};
+// Noise fitted from temporal differences between neighbouring frames, per ISO.
+struct NoiseFit {
+    double iso = 0, shot = 0, read = 0;
+    size_t bins = 0;
+    bool opticalBlack = false;
+};
+struct Preparation {
+    std::vector<DarkFit> darkFits;
+    std::vector<std::vector<ExposureStep>> exposureSteps;  // Per group
+    std::vector<NoiseFit> noiseFits;
+};
+Preparation prepareFrames(const FrameGroups&, const Sidecars&, const Options&, Warnings&);
+// bracket.cpp. Both need clipping and defect masks. measureExposures rescales
+// `effective` of exposure-sorted groups; assignNoise uses those exposures for
+// its temporal differences.
+std::vector<std::vector<ExposureStep>> measureExposures(const FrameGroups&, const Options&, Warnings&);
+std::vector<NoiseFit> assignNoise(const FrameGroups&, const Options&, Warnings&);
 
 constexpr uint32_t lowerBound = 1u << 0, fromND = 1u << 1, moving = 1u << 2,
-                   filled = 1u << 3, missing = 1u << 4, ndInconsistent = 1u << 5,
+                   filled = 1u << 3, missing = 1u << 4, inconsistent = 1u << 5,
                    floored = 1u << 6, adjacentClipFallback = 1u << 7, uncovered = 1u << 8;
 constexpr uint32_t mixedSource = 65535;
 struct Site {
@@ -162,7 +189,8 @@ struct Sample {
     float fraction = 0, extra = 0;
 };
 
-Sample sample(const RawFrame&, int row, int col, size_t index, float black, const Options&);
+// Each frame uses its own black and white levels; they may differ within a bracket.
+Sample sample(const RawFrame&, int row, int col, size_t index, const Options&);
 struct MergeResult {
     std::vector<Site> sites;
     size_t reference = 0;
@@ -175,28 +203,35 @@ struct SiteMerge {
     Site site;
     bool shadow = false;
 };
-SiteMerge mergeSite(const std::vector<RawFrame>& plain, const std::vector<RawFrame>* nd,
-                    RGB transmission, int row, int col, const Options&);
+SiteMerge mergeSite(const std::vector<RawFrame>&, int row, int col, const Options&);
 
-struct BlockCheck { int row, col; RGB ev; std::array<size_t, 3> samples; bool removed; };
+struct BlockCheck { int row, col; RGB ev; std::array<size_t, 3> samples; bool flagged; };
 struct NDResult {
     RGB ev{}, measured{}, mad{};
     std::array<size_t, 3> samples{};
     std::optional<double> sceneDrift;
-    size_t sceneDriftSamples = 0, blockedLowerBounds = 0;
+    size_t sceneDriftSamples = 0;
     std::vector<BlockCheck> blocks;
-    std::vector<float> blockImage;
-    std::vector<uint8_t> rejectedBlocks;
 };
-NDResult calibrateND(const MergeResult&, const std::vector<RawFrame>&, const std::vector<RawFrame>&,
-                     const Mask&, const std::optional<RGB>&, bool checkUncovered,
-                     const Options&, Warnings&);
-NDResult mergeND(MergeResult&, const std::vector<RawFrame>&, const std::vector<RawFrame>&,
-                 const Mask& coverage, const Options&, Warnings&);
+// Measures the attenuation of `filtered` against the merged `reference` group on
+// `calibration` sites (empty: all), and scene drift on `drift` sites, which the
+// filtered frames record without attenuation.
+NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& reference,
+                     const std::vector<RawFrame>& filtered, const Mask& calibration, const Mask& drift,
+                     const std::optional<RGB>& manualEV, const Options&, Warnings&);
+
+// Additive offset between a group and the composite of earlier groups (glare
+// veil, flare or a small level mismatch), measured where both are precise and
+// interpolated into the sites the group supplies.
+struct OffsetMatch {
+    size_t samples = 0, knownCells = 0, corrected = 0, unresolved = 0, capped = 0;
+    RGB median{}, share{};  // Applied offset and its share of the uncorrected signal (medians)
+};
 
 struct GroupResult {
     RGB ev{};
     std::optional<NDResult> calibration;
+    std::optional<OffsetMatch> match;
     size_t measuredSites = 0, boundSites = 0;
 };
 
@@ -235,7 +270,7 @@ Output render(const std::vector<Site>&, const Layout&, const Colour&, double sca
 std::vector<float> readImage(const fs::path&, const Layout&, int& channels);
 int imageChannels(const fs::path&, const Layout&);
 void writeImage(const fs::path&, const Layout&, const Output&, const RawFrame&, const Colour&,
-                const std::optional<NDResult>&, double scale, double referenceAperture, const Options&);
+                double scale, double referenceAperture, const Options&);
 void writeCfa(const fs::path&, const Layout&, const std::vector<Site>&, const Options&,
               const std::vector<uint32_t>& sources);
 
@@ -246,6 +281,9 @@ void run(const Options&);
 double number(const std::string&);
 std::vector<double> numberList(const std::string&, size_t expected);
 double median(std::vector<double>&);  // Requires a nonempty input
+// Variance of the central distribution: a MAD start, then a 4σ-clipped second
+// moment, which stays accurate for integer-quantized data where the MAD does not.
+double robustVariance(std::vector<double>);  // Requires a nonempty input
 
 template<class Function>
 void parallelRows(int rows, unsigned threads, Function function) {

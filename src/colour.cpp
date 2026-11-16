@@ -57,7 +57,7 @@ Colour configureColour(const std::vector<RawFrame>& plain, size_t reference,
         for (const auto& frame : plain)
             if (frame.hasWB)
                 for (int c = 0; c < 3; ++c) values[c].push_back(frame.wb[c]);
-        if (values[0].empty()) warnings.push_back("plain sweep has no camera white balance; using unit multipliers");
+        if (values[0].empty()) warnings.push_back("first group has no camera white balance; using unit multipliers");
         else for (int c = 0; c < 3; ++c) result.wb[c] = median(values[c]);
         customWB = true;
     } else {

@@ -28,7 +28,7 @@ void addChannel(exr::Header& header, exr::FrameBuffer& buffer, const char* name,
 }
 
 void headerAttributes(exr::Header& header, const RawFrame& reference, const Colour& colour,
-                      const std::optional<NDResult>& nd, double scale, double referenceAperture, const Options& o) {
+                      double scale, double referenceAperture, const Options& o) {
     header.insert("rawfuse:version", exr::StringAttribute(RAWFUSE_VERSION));
     header.insert("rawfuse:space", exr::StringAttribute(o.space == "aces" ? "aces-ap0" : "camera"));
     header.insert("rawfuse:exposureReference", exr::FloatAttribute(float(scale)));
@@ -41,8 +41,6 @@ void headerAttributes(exr::Header& header, const RawFrame& reference, const Colo
             for (int j = 0; j < 3; ++j) values[i][j] = float((*colour.matrix)[i][j]);
         header.insert("rawfuse:matrix", exr::M33fAttribute(values));
     }
-    if (nd) header.insert("rawfuse:ndEV", exr::V3fAttribute(
-        imath::V3f(float(nd->ev[0]), float(nd->ev[1]), float(nd->ev[2]))));
     header.insert("rawfuse:report", exr::StringAttribute(o.report.filename().string()));
     if (o.space == "aces") {
         exr::addChromaticities(header, exr::Chromaticities(
@@ -104,11 +102,11 @@ Mask readMask(const fs::path& path, const Layout& layout) {
 }
 
 void writeImage(const fs::path& path, const Layout& layout, const Output& output,
-                const RawFrame& ref, const Colour& colour, const std::optional<NDResult>& nd,
+                const RawFrame& ref, const Colour& colour,
                 double scale, double referenceAperture, const Options& o) {
     exr::Header header(layout.width, layout.height);
     header.compression() = exr::ZIP_COMPRESSION;
-    headerAttributes(header, ref, colour, nd, scale, referenceAperture, o);
+    headerAttributes(header, ref, colour, scale, referenceAperture, o);
     exr::FrameBuffer buffer;
     constexpr const char* rgbNames[] = {"R", "G", "B"};
     constexpr const char* varNames[] = {"var.R", "var.G", "var.B"};
@@ -125,8 +123,6 @@ void writeImage(const fs::path& path, const Layout& layout, const Output& output
         addChannel(header, buffer, "flags", exr::UINT, output.flags.data(), sizeof(uint32_t), layout.width);
         if (!output.sources.empty())
             addChannel(header, buffer, "source", exr::UINT, output.sources.data(), sizeof(uint32_t), layout.width);
-        if (nd && !nd->blockImage.empty())
-            addChannel(header, buffer, "nd.blockDeltaEV", exr::FLOAT, nd->blockImage.data(), sizeof(float), layout.width);
     }
     exr::OutputFile file(path.string().c_str(), header, int(o.threads));
     file.setFrameBuffer(buffer);

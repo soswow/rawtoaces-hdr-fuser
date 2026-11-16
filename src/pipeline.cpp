@@ -9,7 +9,9 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <iomanip>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 
 namespace rawfuse {
@@ -47,14 +49,12 @@ void validatePaths(const Options& o) {
             inputs.push_back(path);
         }
     };
-    addFrames(o.plain);
-    addFrames(o.nd);
     for (const auto& group : o.groups) addFrames(group.files);
     for (const auto& group : o.groups) {
-        for (const auto& mask : {group.validMask, group.contributionMask, group.calibrationMask})
+        for (const auto& mask : {group.validMask, group.contributionMask, group.calibrationMask, group.driftMask})
             if (!mask.empty()) inputs.push_back(mask);
     }
-    for (const auto& sidecar : {o.darkModel, o.ndMask, o.manifest})
+    for (const auto& sidecar : {o.darkModel, o.manifest})
         if (!sidecar.empty()) inputs.push_back(sidecar);
     if (o.vignette != "none" && o.vignette != "dng") inputs.emplace_back(o.vignette);
     if (o.badPixels != "none" && o.badPixels != "dng") inputs.emplace_back(o.badPixels);
@@ -142,30 +142,49 @@ private:
 
 Json rgbReport(const RGB& rgb) { return {{"R", rgb[0]}, {"G", rgb[1]}, {"B", rgb[2]}}; }
 
-std::string noiseSource(const RawFrame& frame, const Options& o) {
-    if (o.noise != "dng") return "custom";
-    return frame.metadata.noise.empty() ? "fallback" : "dng";
-}
-
-Json noiseReport(const RawFrame& f, const Options& o) {
+Json noiseReport(const RawFrame& f) {
     if (f.noise[0].shot == f.noise[1].shot && f.noise[0].shot == f.noise[2].shot &&
         f.noise[0].read == f.noise[1].read && f.noise[0].read == f.noise[2].read)
-        return {{"source", noiseSource(f, o)}, {"S", f.noise[0].shot}, {"O", f.noise[0].read}};
-    return {{"source", noiseSource(f, o)}, {"planes", {
+        return {{"source", f.noiseSource}, {"S", f.noise[0].shot}, {"O", f.noise[0].read}};
+    return {{"source", f.noiseSource}, {"planes", {
         {"R", {{"S", f.noise[0].shot}, {"O", f.noise[0].read}}},
         {"G", {{"S", f.noise[1].shot}, {"O", f.noise[1].read}}},
         {"B", {{"S", f.noise[2].shot}, {"O", f.noise[2].read}}}}}};
 }
 
-Json inputReport(const RawFrame& f, const char* role, const Options& o) {
+Json optionalNumber(double value) { return std::isfinite(value) && value > 0 ? Json(value) : Json(nullptr); }
+
+Json inputReport(const RawFrame& f, const char* role) {
     const auto& m = f.metadata;
     return {{"path", f.path.string()}, {"role", role}, {"index", f.inputIndex + 1},
             {"exposure_time", m.exposure}, {"seconds", m.seconds}, {"iso", m.iso},
-            {"f_number", m.aperture}, {"effective_exposure", f.effective},
+            {"f_number", m.aperture}, {"exif_effective_exposure", f.exifEffective},
+            {"effective_exposure", f.effective},
+            {"exposure_correction_ev", std::log2(f.effective / f.exifEffective)},
             {"as_shot_neutral", m.neutral ? Json(*m.neutral) : Json(nullptr)},
             {"image_description", m.description}, {"xmp", m.xmp}, {"capture_date", m.captureDate},
-            {"baseline_exposure", m.baseline}, {"noise_profile", noiseReport(f, o)},
+            {"baseline_exposure", m.baseline}, {"noise_profile", noiseReport(f)},
+            {"optical_black_sigma_dn", optionalNumber(f.opticalBlackSigma)},
+            {"black_level", f.blackPattern}, {"white_level", f.white},
             {"hot_sites", {{"kept", f.hotKept}, {"missing", f.hotMissing}, {"model_rejected", f.hotRejected}}}};
+}
+
+Json stepsReport(const std::vector<ExposureStep>& steps) {
+    Json result = Json::array();
+    for (const auto& step : steps)
+        result.push_back({{"from", step.from}, {"to", step.to}, {"exif_ratio", step.exifRatio},
+                          {"measured_ratio", optionalNumber(step.measuredRatio)}, {"samples", step.samples},
+                          {"ratio", step.ratio}, {"applied", step.applied},
+                          {"borrowed_from", step.borrowedFrom.empty() ? Json(nullptr) : Json(step.borrowedFrom)}});
+    return result;
+}
+
+Json noiseFitsReport(const std::vector<NoiseFit>& fits) {
+    Json result = Json::array();
+    for (const auto& fit : fits)
+        result.push_back({{"iso", fit.iso}, {"S", fit.shot}, {"O", fit.read}, {"fit_points", fit.bins},
+                          {"read_noise", fit.opticalBlack ? "optical_black" : "bracket"}});
+    return result;
 }
 
 Json whiteBalanceSpread(const std::vector<RawFrame>& frames, Warnings& warnings) {
@@ -181,7 +200,7 @@ Json whiteBalanceSpread(const std::vector<RawFrame>& frames, Warnings& warnings)
     if (!std::isfinite(low[0])) return nullptr;
     for (int i = 0; i < 3; ++i) spread[i] = std::log2(high[i] / low[i]);
     if (*std::max_element(spread.begin(), spread.end()) > 0.05)
-        warnings.push_back("AsShotNeutral varies across plain frames; applying one white balance after fusion");
+        warnings.push_back("AsShotNeutral varies across the first group's frames; applying one white balance after fusion");
     return {{"min", rgbReport(low)}, {"max", rgbReport(high)}, {"ev", rgbReport(spread)}};
 }
 
@@ -192,22 +211,30 @@ Json darkReport(const DarkFit& fit) {
             {"relative_uncertainty", fit.uncertainty}, {"sites", fit.sites}, {"observations", fit.observations}};
 }
 
-Json ndReport(const NDResult& nd, size_t count, bool manual, const fs::path& mask, const std::string& use) {
-    Json blocks = Json::array(), rejected = Json::array();
+Json calibrationReport(const NDResult& nd, bool manual, const InputGroup& group) {
+    Json blocks = Json::array(), flagged = Json::array();
     for (const auto& block : nd.blocks) {
         blocks.push_back({{"row", block.row}, {"col", block.col}, {"ev", rgbReport(block.ev)},
                           {"samples", block.samples}});
-        if (block.removed) rejected.push_back({{"row", block.row}, {"col", block.col}});
+        if (block.flagged) flagged.push_back({{"row", block.row}, {"col", block.col}});
     }
-    return {{"frames", count}, {"method", manual ? "manual" : "auto"}, {"ev", rgbReport(nd.ev)},
+    return {{"method", manual ? "manual" : "auto"}, {"ev", rgbReport(nd.ev)},
             {"measured_ev", rgbReport(nd.measured)}, {"mad_ev", rgbReport(nd.mad)},
             {"samples", {{"R", nd.samples[0]}, {"G", nd.samples[1]}, {"B", nd.samples[2]}}},
-            {use == "calibration" ? "blocks_flagged" : "blocks_removed", std::move(rejected)},
-            {"blocks", std::move(blocks)},
+            {"blocks_flagged", std::move(flagged)}, {"blocks", std::move(blocks)},
             {"scene_drift_ev", nd.sceneDrift ? Json(*nd.sceneDrift) : Json(nullptr)},
             {"scene_drift_samples", nd.sceneDriftSamples},
-            {"blocked_lower_bound_sites", nd.blockedLowerBounds},
-            {"mask", mask.string()}, {"use", use}};
+            {"calibration_mask", group.calibrationMask.string()}, {"drift_mask", group.driftMask.string()}};
+}
+
+// Offsets are reported in camera RGB at the output exposure scale.
+Json matchReport(const std::optional<OffsetMatch>& match, double scale) {
+    if (!match) return nullptr;
+    const RGB median{match->median[0] * scale, match->median[1] * scale, match->median[2] * scale};
+    return {{"overlap_samples", match->samples}, {"known_cells", match->knownCells},
+            {"corrected_sites", match->corrected}, {"unresolved_sites", match->unresolved},
+            {"capped_sites", match->capped},
+            {"median_offset", rgbReport(median)}, {"median_share", rgbReport(match->share)}};
 }
 
 Json mergeReport(const MergeResult& merge, const Output& output) {
@@ -222,19 +249,138 @@ Json mergeReport(const MergeResult& merge, const Output& output) {
     const double size = double(merge.sites.size());
     return {{"lower_bound_fraction", counts[0] / size}, {"from_nd_fraction", counts[1] / size},
             {"moving_fraction", counts[2] / size}, {"filled_fraction", counts[3] / size},
-            {"missing_fraction", counts[4] / size}, {"nd_inconsistent_fraction", counts[5] / size},
+            {"missing_fraction", counts[4] / size}, {"inconsistent_fraction", counts[5] / size},
             {"shadow_fraction", merge.shadow / size}, {"unsupported_fraction", unsupported / size},
             {"adjacent_clip_fallback_fraction", adjacent / size},
             {"uncovered_fraction", outside / size},
             {"floored_fraction", output.flooredPixels / size}};
 }
 
+std::string grouped(size_t n) {
+    auto text = std::to_string(n);
+    for (int i = int(text.size()) - 3; i > 0; i -= 3) text.insert(size_t(i), ",");
+    return text;
+}
+
+std::string fixed(double value, int digits) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(digits) << value;
+    return text.str();
+}
+
+std::string seconds(double value) {
+    if (value >= 0.3) return fixed(value, value >= 10 ? 0 : 1) + " s";
+    std::ostringstream text;
+    text << "1/" << std::setprecision(4) << 1 / value << " s";
+    return text.str();
+}
+
+std::string evText(const RGB& ev) {
+    if (ev[0] == ev[1] && ev[1] == ev[2]) return fixed(ev[1], 2) + " EV";
+    return "R " + fixed(ev[0], 2) + " G " + fixed(ev[1], 2) + " B " + fixed(ev[2], 2) + " EV";
+}
+
+std::string percent(double fraction) {
+    if (fraction == 0) return "0%";
+    return fixed(100 * fraction, fraction < 0.001 ? 4 : fraction < 0.01 ? 3 : 1) + "%";
+}
+
+// Progress and outcome lines on stderr; --quiet keeps only warnings and errors.
+struct Status {
+    const Options& o;
+    void operator()(const std::string& line) const {
+        if (!o.quiet) std::cerr << "rawfuse: " << line << '\n';
+    }
+};
+
+void reportBrackets(const Status& status, const FrameGroups& frames, const Preparation& preparation,
+                    const Options& o) {
+    for (size_t g = 0; g < frames.size(); ++g) {
+        const auto& group = *frames[g];
+        std::ostringstream line;
+        line << o.groups[g].name << ": " << group.size() << (group.size() == 1 ? " frame" : " frames");
+        if (group.size() > 1)
+            line << ", " << seconds(group.front().metadata.seconds) << " to " << seconds(group.back().metadata.seconds);
+        else line << ", " << seconds(group.front().metadata.seconds);
+        const auto& steps = preparation.exposureSteps[g];
+        if (o.exposures == "exif") line << "; EXIF exposures";
+        else if (!steps.empty()) {
+            size_t measured = 0, borrowed = 0;
+            double largest = 0;
+            for (const auto& step : steps) {
+                measured += step.applied;
+                borrowed += !step.applied && !step.borrowedFrom.empty();
+                largest = std::max(largest, std::abs(std::log2(step.ratio / step.exifRatio)));
+            }
+            line << "; exposure steps measured " << measured << " of " << steps.size();
+            if (borrowed) line << ", " << borrowed << " borrowed";
+            if (steps.size() > measured + borrowed) line << ", " << steps.size() - measured - borrowed << " EXIF";
+            line << " (largest correction " << fixed(largest, 2) << " EV)";
+        }
+        status(line.str());
+    }
+    const auto& noise = frames.front()->front();
+    std::ostringstream line;
+    line << "noise: ";
+    if (noise.noiseSource == "dng") line << "DNG NoiseProfile";
+    else if (noise.noiseSource == "custom") line << "--noise";
+    else if (noise.noiseSource == "generic") line << "generic estimate (nothing to measure)";
+    else {
+        line << "measured from frame pairs";
+        for (const auto& fit : preparation.noiseFits)
+            line << "; ISO " << fixed(fit.iso, 0) << " shot " << std::setprecision(2) << fit.shot
+                 << ", read " << fit.read << (fit.opticalBlack ? " (optical black)" : "");
+    }
+    status(line.str());
+}
+
+void reportComposition(const Status& status, const std::vector<GroupResult>& results, double scale,
+                       const Options& o) {
+    for (size_t g = 0; g < results.size(); ++g) {
+        const auto& spec = o.groups[g];
+        const auto& result = results[g];
+        if (result.calibration) {
+            const auto& nd = *result.calibration;
+            std::ostringstream line;
+            line << spec.name << ": " << (spec.ev ? "ev " + evText(nd.ev) + " (manual), checked against "
+                                                 : "ev " + evText(nd.ev) + " measured against ")
+                 << spec.calibrationReference << " on " << grouped(nd.samples[0]) << "/" << grouped(nd.samples[1])
+                 << "/" << grouped(nd.samples[2]) << " R/G/B sites";
+            if (spec.ev) line << " (measured " << evText(nd.measured) << ")";
+            if (nd.sceneDrift) line << "; scene drift " << fixed(*nd.sceneDrift, 2) << " EV";
+            status(line.str());
+        } else if (spec.ev) status(spec.name + ": ev " + evText(*spec.ev) + " (manual, unchecked)");
+        std::ostringstream line;
+        line << spec.name << ": supplies " << grouped(result.measuredSites) << " sites";
+        if (result.boundSites) line << " and " << grouped(result.boundSites) << " clipped lower bounds";
+        if (!g) line << " (reference)";
+        else line << (spec.contributionMask.empty() ? " (fills gaps)" : " (replaces inside its contribution mask, fills elsewhere)");
+        status(line.str());
+        if (result.match) {
+            const auto& m = *result.match;
+            std::ostringstream match;
+            match << spec.name << ": ";
+            if (!m.corrected && !m.unresolved) match << "offset match: nothing to correct";
+            else if (!m.knownCells) match << "offset match: no precise overlap with earlier groups; not corrected";
+            else {
+                match << "offset matched to earlier groups from " << grouped(m.samples)
+                      << " overlap sites; subtracted a median " << std::setprecision(3) << m.median[1] * scale
+                      << " (G, camera RGB at output scale), " << fixed(100 * m.share[1], 0) << "% of its signal, at "
+                      << grouped(m.corrected) << " sites";
+                if (m.capped) match << " (" << grouped(m.capped) << " capped at their full value)";
+                if (m.unresolved) match << ", " << grouped(m.unresolved) << " beyond reach";
+            }
+            status(match.str());
+        }
+    }
+}
+
 void fuse(const Options& o, Warnings& warnings) {
     Timings time;
+    const Status status{o};
     validatePaths(o);
     ThreadSettings threads(o.threads);
-    const bool grouped = !o.groups.empty();
-    std::vector<std::vector<RawFrame>> storage(grouped ? o.groups.size() : 2);
+    std::vector<std::vector<RawFrame>> storage(o.groups.size());
     FrameGroups frames;
     for (auto& group : storage) frames.push_back(&group);
     const auto& plain = storage.front();
@@ -249,39 +395,34 @@ void fuse(const Options& o, Warnings& warnings) {
             if (!sidecars) sidecars = loadSidecars(o, frames.back().layout);
         }
     };
-    if (grouped) {
-        for (size_t g = 0; g < o.groups.size(); ++g) read(o.groups[g].files, storage[g]);
-    } else {
-        read(o.plain, storage.front());
-        read(o.nd, storage[1]);
-    }
+    for (size_t g = 0; g < o.groups.size(); ++g) read(o.groups[g].files, storage[g]);
     const double referenceAperture = validateFrames(frames, warnings);
     auto byExposure = [](const auto& a, const auto& b) { return a.effective < b.effective; };
     for (auto* group : frames) std::stable_sort(group->begin(), group->end(), byExposure);
     time.mark("decode");
-
-    const auto darkFits = prepareFrames(frames, *sidecars, o, warnings);
-    time.mark("prepare");
-    if (o.verbose) std::cerr << "Merging Bayer samples\n";
-    MergeResult merge;
-    std::optional<NDResult> nd;
-    std::vector<uint32_t> sources;
-    std::vector<GroupResult> groupResults;
-    if (grouped) {
-        auto composition = mergeGroups(frames, *sidecars, o, warnings);
-        merge = std::move(composition.mosaic);
-        sources = std::move(composition.sources);
-        groupResults = std::move(composition.groups);
-        time.mark("group_merge");
-    } else {
-        merge = mergePlain(plain, o, {}, !storage[1].empty());
-        time.mark("plain_merge");
-        if (!storage[1].empty()) {
-            if (o.verbose) std::cerr << "Calibrating and merging ND exposures\n";
-            nd = mergeND(merge, plain, storage[1], sidecars->ndCoverage, o, warnings);
-            time.mark("nd_merge");
-        }
+    {
+        size_t count = 0;
+        for (const auto* group : frames) count += group->size();
+        const auto& first = plain.front();
+        status("read " + std::to_string(count) + " frames in " + std::to_string(frames.size()) +
+               (frames.size() == 1 ? " group" : " groups") + " from " + first.make + " " + first.model + " (" +
+               std::to_string(first.layout.width) + "x" + std::to_string(first.layout.height) + " " +
+               first.layout.pattern() + ")");
     }
+
+    const auto preparation = prepareFrames(frames, *sidecars, o, warnings);
+    time.mark("prepare");
+    reportBrackets(status, frames, preparation, o);
+    if (o.verbose) std::cerr << "Merging Bayer samples\n";
+    auto composition = mergeGroups(frames, *sidecars, o, warnings);
+    auto merge = std::move(composition.mosaic);
+    auto sources = std::move(composition.sources);
+    const auto groupResults = std::move(composition.groups);
+    time.mark("merge");
+    double sum = 0;
+    for (const auto& frame : plain) sum += std::log(frame.effective);
+    const double scale = o.normalize == "none" ? 1 : std::exp(sum / plain.size());
+    reportComposition(status, groupResults, scale, o);
     sidecars.reset();
     const auto& ref = plain[merge.reference];
     for (auto* group : frames) releaseMosaics(*group);
@@ -307,9 +448,6 @@ void fuse(const Options& o, Warnings& warnings) {
         time.mark("write_cfa");
     }
     repairSites(merge.sites, ref.layout, colour.wb, o, sources);
-    double sum = 0;
-    for (const auto& frame : plain) sum += std::log(frame.effective);
-    const double scale = o.normalize == "none" ? 1 : std::exp(sum / plain.size());
     if (o.verbose) std::cerr << "Demosaicing and converting colour\n";
     const auto output = render(merge.sites, ref.layout, colour, scale, o, sources);
     time.mark("render");
@@ -317,36 +455,30 @@ void fuse(const Options& o, Warnings& warnings) {
     const auto stats = mergeReport(merge, output);
     std::vector<Site>().swap(merge.sites);
     StagedFile imageFile(o.output), reportFile(o.report);
-    writeImage(imageFile.path(), ref.layout, output, ref, colour, nd, scale, referenceAperture, o);
+    writeImage(imageFile.path(), ref.layout, output, ref, colour, scale, referenceAperture, o);
     time.mark("write_exr");
 
     Json inputs = Json::array();
     Json groupsReport = Json::array();
-    auto append = [&](const std::vector<RawFrame>& group, const char* role, const InputGroup* spec) {
-        std::vector<Json> byInput(group.size());
-        for (const auto& f : group) {
-            auto input = inputReport(f, role, o);
-            if (spec) input["group"] = spec->name;
+    for (size_t g = 0; g < o.groups.size(); ++g) {
+        const auto& spec = o.groups[g];
+        const auto& result = groupResults[g];
+        std::vector<Json> byInput(storage[g].size());
+        for (const auto& f : storage[g]) {
+            auto input = inputReport(f, spec.ev || spec.autoEV ? "attenuated" : "plain");
+            input["group"] = spec.name;
             byInput[f.inputIndex] = std::move(input);
         }
         for (auto& f : byInput) inputs.push_back(std::move(f));
-    };
-    if (grouped) {
-        for (size_t g = 0; g < o.groups.size(); ++g) {
-            const auto& spec = o.groups[g];
-            const auto& result = groupResults[g];
-            append(storage[g], spec.ev || spec.autoEV ? "nd" : "plain", &spec);
-            groupsReport.push_back({{"name", spec.name}, {"source_id", g + 1},
-                {"valid_mask", spec.validMask.string()}, {"contribution_mask", spec.contributionMask.string()},
-                {"ev", rgbReport(result.ev)}, {"calibration_reference", spec.calibrationReference},
-                {"calibration", result.calibration ? ndReport(*result.calibration, storage[g].size(),
-                    bool(spec.ev), spec.calibrationMask, "calibration") : Json(nullptr)},
-                {"measured_sites", result.measuredSites}, {"lower_bound_sites", result.boundSites},
-                {"dark_model", o.darkModel.empty() ? Json(nullptr) : darkReport(darkFits[g])}});
-        }
-    } else {
-        append(plain, "plain", nullptr);
-        append(storage[1], "nd", nullptr);
+        groupsReport.push_back({{"name", spec.name}, {"source_id", g + 1}, {"frames", storage[g].size()},
+            {"valid_mask", spec.validMask.string()}, {"contribution_mask", spec.contributionMask.string()},
+            {"ev", rgbReport(result.ev)}, {"calibration_reference", spec.calibrationReference},
+            {"calibration", result.calibration ?
+                calibrationReport(*result.calibration, bool(spec.ev), spec) : Json(nullptr)},
+            {"exposure_steps", stepsReport(preparation.exposureSteps[g])},
+            {"measured_sites", result.measuredSites}, {"lower_bound_sites", result.boundSites},
+            {"offset_match", matchReport(result.match, scale)},
+            {"dark_model", o.darkModel.empty() ? Json(nullptr) : darkReport(preparation.darkFits[g])}});
     }
     const Json report{
         {"rawfuse_version", RAWFUSE_VERSION}, {"inputs", std::move(inputs)},
@@ -356,14 +488,12 @@ void fuse(const Options& o, Warnings& warnings) {
         {"white_balance", {{"method", o.wb}, {"multipliers", colour.wb}, {"spread_across_frames", spread}}},
         {"matrix", {{"method", o.matrix}, {"values", colour.matrix ? Json(*colour.matrix) : Json(nullptr)}}},
         {"exposure_reference", scale}, {"reference_f_number", referenceAperture},
-        {"noise_profile", noiseReport(ref, o)},
+        {"exposures", o.exposures},
+        {"noise_profile", noiseReport(ref)}, {"noise_fits", noiseFitsReport(preparation.noiseFits)},
         {"output_floor", o.outputFloor > 0 ? Json(o.outputFloor) : Json(nullptr)},
-        {"dark_model", o.darkModel.empty() ? Json(nullptr) : Json{
-            {"path", o.darkModel.string()}, {"plain", darkReport(darkFits[0])},
-            {"nd", nd ? darkReport(darkFits[1]) : Json(nullptr)}}},
+        {"dark_model", o.darkModel.empty() ? Json(nullptr) : Json(o.darkModel.string())},
         {"vignette", {{"source", field.source}, {"gain_maps", field.maps}, {"max_gain", rgbReport(field.maxGain)}}},
-        {"nd", nd ? ndReport(*nd, storage[1].size(), bool(o.ndEv), o.ndMask, o.ndUse) : Json(nullptr)},
-        {"groups", grouped ? std::move(groupsReport) : Json(nullptr)}, {"merge", stats},
+        {"groups", std::move(groupsReport)}, {"merge", stats},
         {"demosaic", o.demosaic}, {"warnings", warnings}, {"timing_seconds", time.values}};
     {
         std::ofstream stream(reportFile.path(), std::ios::binary);
@@ -381,6 +511,17 @@ void fuse(const Options& o, Warnings& warnings) {
         if (cfaFile) cfaFile->rollback();
         throw;
     }
+    std::ostringstream outcome;
+    outcome << "result: " << percent(stats["missing_fraction"].get<double>()) << " of sites missing, "
+            << percent(stats["lower_bound_fraction"].get<double>()) << " clipped lower bounds, "
+            << percent(stats["moving_fraction"].get<double>()) << " motion-rejected samples, "
+            << percent(stats["inconsistent_fraction"].get<double>()) << " inconsistent";
+    status(outcome.str());
+    status("wrote " + o.output.string() + " (" + (o.space == "aces" ? "ACES AP0" : "camera RGB") + ") and " +
+           o.report.string() + (o.writeCfa.empty() ? "" : " and " + o.writeCfa.string()) + " in " +
+           fixed(time.values["total"].get<double>(), 1) + " s" +
+           (warnings.empty() ? "" : "; " + std::to_string(warnings.size()) +
+                                (warnings.size() == 1 ? " warning follows" : " warnings follow")));
 }
 
 void printWarnings(const Warnings& warnings) {
