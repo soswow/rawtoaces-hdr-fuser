@@ -284,9 +284,16 @@ def main(exe, folder):
     sat = folder / "saturated.dng"
     dng(sat, (1, 5), lambda y, x, c: 1 if x < 8 else 0.5)
     _, (_, highlight) = fuse("highlight", sat, "--space", "aces", "--wb", "custom:2,1,3",
-                              "--matrix", f"custom:{matrix}", "--aux")
+                              "--matrix", f"custom:{matrix}", "--aux", "--highlights", "neutral")
     for c in "RGB":
         close(highlight[c][2 * SIZE + 2], 3)
+    assert highlight["flags"][2 * SIZE + 2] & 1
+    # Reconstruction gives the fully clipped area the rim's colour (equal raw
+    # values) at the lowest level its bounds allow.
+    _, (_, highlight) = fuse("highlight-rim", sat, "--space", "aces", "--wb", "custom:2,1,3",
+                              "--matrix", f"custom:{matrix}", "--aux")
+    for c, expected in zip("RGB", (1, 2, 3)):
+        close(highlight[c][2 * SIZE + 2], expected)
     assert highlight["flags"][2 * SIZE + 2] & 1
 
     edge_short = folder / "edge-short.dng"

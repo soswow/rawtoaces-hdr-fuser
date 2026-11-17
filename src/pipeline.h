@@ -42,7 +42,7 @@ struct Options {
     std::string normalize = "geomean", badPixels = "dng", noise = "auto";
     std::string exposures = "measured";
     std::optional<Matrix> customMatrix;  // Parsed --matrix custom:FILE
-    std::string vignette = "dng", highlights = "neutral", demosaic = "bilinear";
+    std::string vignette = "dng", highlights = "reconstruct", demosaic = "bilinear";
     double outputFloor = 0;
     int reference = 0, clipDilate = 1;
     unsigned threads = 1;
@@ -177,7 +177,8 @@ std::vector<NoiseFit> assignNoise(const FrameGroups&, const Options&, Warnings&)
 
 constexpr uint32_t lowerBound = 1u << 0, fromND = 1u << 1, moving = 1u << 2,
                    filled = 1u << 3, missing = 1u << 4, inconsistent = 1u << 5,
-                   floored = 1u << 6, adjacentClipFallback = 1u << 7, uncovered = 1u << 8;
+                   floored = 1u << 6, adjacentClipFallback = 1u << 7, uncovered = 1u << 8,
+                   reconstructed = 1u << 9;
 constexpr uint32_t mixedSource = 65535;
 struct Site {
     float signal = 0, variance = 0;

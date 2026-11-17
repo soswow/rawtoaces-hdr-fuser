@@ -239,12 +239,13 @@ Json matchReport(const std::optional<OffsetMatch>& match, double scale) {
 
 Json mergeReport(const MergeResult& merge, const Output& output) {
     std::array<size_t, 7> counts{};
-    size_t unsupported = 0, adjacent = 0, outside = 0;
+    size_t unsupported = 0, adjacent = 0, outside = 0, rebuilt = 0;
     for (const auto& site : merge.sites) {
         for (int bit = 0; bit < 6; ++bit) counts[bit] += (site.flags >> bit) & 1;
         unsupported += !site.frames;
         adjacent += (site.flags & adjacentClipFallback) != 0;
         outside += (site.flags & uncovered) != 0;
+        rebuilt += (site.flags & reconstructed) != 0;
     }
     const double size = double(merge.sites.size());
     return {{"lower_bound_fraction", counts[0] / size}, {"from_nd_fraction", counts[1] / size},
@@ -252,7 +253,7 @@ Json mergeReport(const MergeResult& merge, const Output& output) {
             {"missing_fraction", counts[4] / size}, {"inconsistent_fraction", counts[5] / size},
             {"shadow_fraction", merge.shadow / size}, {"unsupported_fraction", unsupported / size},
             {"adjacent_clip_fallback_fraction", adjacent / size},
-            {"uncovered_fraction", outside / size},
+            {"uncovered_fraction", outside / size}, {"reconstructed_fraction", rebuilt / size},
             {"floored_fraction", output.flooredPixels / size}};
 }
 

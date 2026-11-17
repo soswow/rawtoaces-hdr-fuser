@@ -209,6 +209,154 @@ FlatField flatField(std::vector<Site>& sites, const RawFrame& ref, const Options
     return result;
 }
 
+namespace {
+
+// Opposed-channel highlight reconstruction in white-balanced camera RGB.
+// Clipped quads form 8-connected regions. Unclipped quads within two quads of
+// a region give its colour as ratios of channel sums, so brighter rim quads
+// count more than the steep, aliased edge. A clipped site is estimated from
+// the unclipped other-colour sites around it times those ratios, and never
+// falls below its own bound or a neighbouring bound carried through the ratios.
+// Without a rim the colour is unknown and the estimate is neutral.
+void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const RGB& wb,
+                           std::vector<uint32_t>& sources) {
+    std::vector<size_t> clipped;
+    for (size_t i = 0; i < sites.size(); ++i)
+        if (sites[i].flags & lowerBound) clipped.push_back(i);
+    if (clipped.empty()) return;
+
+    const int quadWidth = (layout.width + 1) / 2, quadHeight = (layout.height + 1) / 2;
+    auto quadOf = [&](size_t i) {
+        return size_t(i / layout.width / 2) * quadWidth + (i % layout.width) / 2;
+    };
+    auto valued = [&](size_t i) {
+        const auto flags = sites[i].flags;
+        return !(flags & uncovered) && (flags & (missing | filled)) != missing;
+    };
+    constexpr int32_t unclipped = -1, unlabelled = -2;
+    std::vector<int32_t> region(size_t(quadWidth) * quadHeight, unclipped);
+    for (size_t i : clipped) region[quadOf(i)] = unlabelled;
+
+    std::vector<std::array<double, 3>> sums;
+    std::vector<int> rimQuads;
+    std::vector<int32_t> seen(region.size(), unclipped);
+    std::vector<size_t> queue;
+    for (size_t i : clipped) {
+        const size_t start = quadOf(i);
+        if (region[start] != unlabelled) continue;
+        const auto label = int32_t(sums.size());
+        sums.push_back({});
+        rimQuads.push_back(0);
+        region[start] = label;
+        queue.assign(1, start);
+        for (size_t k = 0; k < queue.size(); ++k) {
+            const int qy = int(queue[k] / quadWidth), qx = int(queue[k] % quadWidth);
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int ny = qy + dy, nx = qx + dx;
+                    if (ny < 0 || nx < 0 || ny >= quadHeight || nx >= quadWidth) continue;
+                    const size_t n = size_t(ny) * quadWidth + nx;
+                    if (region[n] == unlabelled && std::abs(dy) <= 1 && std::abs(dx) <= 1) {
+                        region[n] = label;
+                        queue.push_back(n);
+                    }
+                    if (region[n] != unclipped || seen[n] == label) continue;
+                    seen[n] = label;
+                    if (2 * ny + 1 >= layout.height || 2 * nx + 1 >= layout.width) continue;
+                    std::array<double, 3> quad{};
+                    bool measured = true;
+                    for (int y = 2 * ny; y < 2 * ny + 2 && measured; ++y)
+                        for (int x = 2 * nx; x < 2 * nx + 2; ++x) {
+                            const size_t j = layout.index(y, x);
+                            if (!valued(j) || sites[j].signal <= 0) {
+                                measured = false;
+                                break;
+                            }
+                            const int c = layout.colour(y, x);
+                            quad[c] += sites[j].signal * wb[c] * (c == 1 ? 0.5 : 1);
+                        }
+                    if (!measured) continue;
+                    for (int c = 0; c < 3; ++c) sums[label][c] += quad[c];
+                    ++rimQuads[label];
+                }
+        }
+    }
+
+    struct Update { size_t index; float signal, variance; uint16_t flags; uint32_t source; };
+    std::vector<Update> updates;
+    updates.reserve(clipped.size());
+    for (size_t i : clipped) {
+        const int y = int(i / layout.width), x = int(i % layout.width);
+        const int c = layout.colour(y, x);
+        const auto& sum = sums[region[quadOf(i)]];
+        const bool coloured = rimQuads[region[quadOf(i)]] >= 4 && sum[0] > 0 && sum[1] > 0 && sum[2] > 0;
+        double lower = sites[i].signal * wb[c], estimate = 0, estimateVariance = 0;
+        int estimates = 0;
+        uint16_t donorFlags = 0;
+        uint32_t source = sources.empty() ? 0 : sources[i];
+        for (int k = 0; k < 3; ++k) {
+            if (k == c) continue;
+            const double ratio = coloured ? sum[c] / sum[k] : 1;
+            double total = 0, variance = 0, bound = 0;
+            int count = 0;
+            uint16_t flags = 0;
+            uint32_t donor = 0;
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int ny = y + dy, nx = x + dx;
+                    if (ny < 0 || nx < 0 || ny >= layout.height || nx >= layout.width) continue;
+                    if (layout.colour(ny, nx) != k) continue;
+                    const size_t j = layout.index(ny, nx);
+                    if (!valued(j)) continue;
+                    const double value = sites[j].signal * wb[k];
+                    if (sites[j].flags & lowerBound) {
+                        bound = std::max(bound, value);
+                        continue;
+                    }
+                    total += value;
+                    variance += sites[j].variance * wb[k] * wb[k];
+                    flags |= sites[j].flags;
+                    if (!sources.empty() && sources[j])
+                        donor = !donor || donor == sources[j] ? sources[j] : mixedSource;
+                    ++count;
+                }
+            lower = std::max(lower, ratio * bound);
+            if (!count) continue;
+            const double value = ratio * total / count;
+            // Two channels estimate the same quantity when the colour is known.
+            // Without it, keep the neutral behaviour: the brightest one wins.
+            if (coloured || value > estimate) {
+                estimate = coloured ? estimate + value : value;
+                estimateVariance = coloured ? estimateVariance + ratio * ratio * variance / (count * count)
+                                            : ratio * ratio * variance / (count * count);
+                estimates = coloured ? estimates + 1 : 1;
+            }
+            donorFlags |= flags;
+            if (donor) source = !source || source == donor ? donor : mixedSource;
+        }
+        if (estimates) {
+            estimate /= estimates;
+            estimateVariance /= double(estimates) * estimates;
+        }
+        double value = lower, variance = 0;
+        if (estimates && estimate > lower) {
+            value = estimate;
+            variance = estimateVariance;
+        }
+        if (value <= sites[i].signal * wb[c]) continue;
+        updates.push_back({i, float(value / wb[c]), float(variance / (wb[c] * wb[c])),
+                           uint16_t(sites[i].flags | reconstructed | donorFlags), source});
+    }
+    for (const auto& u : updates) {
+        sites[u.index].signal = u.signal;
+        sites[u.index].variance = u.variance;
+        sites[u.index].flags = u.flags;
+        if (!sources.empty()) sources[u.index] = u.source;
+    }
+}
+
+} // namespace
+
 void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, const Options& o,
                  std::vector<uint32_t>& sources) {
     std::vector<size_t> holes;
@@ -257,6 +405,10 @@ void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, 
         propagate(green ? axial : diagonals, 2);
     }
     if (o.highlights == "bound") return;
+    if (o.highlights == "reconstruct") {
+        reconstructHighlights(sites, layout, wb, sources);
+        return;
+    }
     parallelRows((layout.height + 1) / 2, o.threads, [&](int row) {
         const int y = row * 2;
         for (int x = 0; x < layout.width; x += 2) {

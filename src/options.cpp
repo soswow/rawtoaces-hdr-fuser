@@ -68,7 +68,8 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --low F --high F                    Signal range (0.0083, 0.88)
   --clip-margin F --clip-dilate N      Saturation margin and radius (0.001, 1)
   --vignette dng|none|FILE             DNG gain maps or float flat-field EXR
-  --highlights neutral|bound
+  --highlights reconstruct|neutral|bound
+                                      Clipped-site estimate (reconstruct)
   --demosaic bilinear|mhc
   --allow-scene-drift                 Keep a manual group ev despite measured scene drift
   --write-cfa PATH                    Diagnostic mosaic EXR
@@ -162,7 +163,7 @@ Options parseOptions(int argc, char** argv) {
     if (o.report.empty()) o.report = fs::path(o.output).replace_extension(".json");
     oneOf("--space", o.space, {"aces", "camera"});
     oneOf("--normalize", o.normalize, {"geomean", "none"});
-    oneOf("--highlights", o.highlights, {"neutral", "bound"});
+    oneOf("--highlights", o.highlights, {"reconstruct", "neutral", "bound"});
     oneOf("--demosaic", o.demosaic, {"bilinear", "mhc"});
     oneOf("--exposures", o.exposures, {"measured", "exif"});
     if (o.matrix.rfind("custom:", 0) == 0) {

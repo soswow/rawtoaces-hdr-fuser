@@ -89,7 +89,13 @@ The manifest format is in the [README](../README.md). Validity masks apply befor
 
 These run after the flat field so colour comparisons use flat-fielded values.
 
-- **Lower-bound sites** (`--highlights neutral`): in white-balanced camera space, a quad with any lower-bound site gets each of those sites raised to at least the quad's brightest white-balanced value, so fully clipped areas come out neutral instead of magenta. `bound` leaves the raw bounds.
+- **Lower-bound sites** (`--highlights reconstruct`, the default) are estimated from the channels that did not clip, in white-balanced camera space, before the colour matrix mixes channels:
+  - Quads with a lower-bound site form 8-connected regions. The unclipped quads within two quads of a region give its colour as ratios of channel sums, so bright rim quads outweigh dim, aliased edge quads. A region needs at least four rim quads.
+  - Each clipped site is the mean of its 3 × 3 neighbourhood's unclipped other-colour sites, each multiplied by the region's ratio to the clipped colour. It never drops below its own bound, nor below a neighbouring bound carried through the ratio. Where all channels clip, the bounds set the level and the rim sets the colour.
+  - Without a usable rim the colour is unknown and the estimate is neutral: the brightest carried value wins.
+  - Raised sites keep `LOWER_BOUND`, gain `RECONSTRUCTED`, and inherit the donors' flags and sources. A value from a measurement carries that measurement's variance through the ratio; a value from a bound has zero variance.
+
+  The estimate assumes the clipped area has the colour of its rim, which suits small sources such as the sun's disc and a lamp. A clipped area that differs in colour from everything around it cannot be recovered. `neutral`, the previous default, raises each lower-bound site to the quad's brightest white-balanced value: fully clipped areas come out neutral instead of magenta, but a site raised past its own bound (green to red's level, say) makes a partly clipped source yellow. `bound` leaves the raw bounds.
 - **Missing sites** are filled with the variance-weighted mean of the nearest same-colour sites with data (R and B: the four sites two away horizontally and vertically, then the four diagonals. G: the four diagonal G neighbours) and flagged `FILLED`.
 
 Repairs keep `MISSING` as a record of absent measurements and inherit quality flags and group source IDs from the donors actually used. Sites excluded by every contribution mask remain `MISSING | UNCOVERED` and provide no interpolation taps to their neighbours.
@@ -131,7 +137,7 @@ A non-DNG capture date is LibRaw's local wall-clock timestamp, formatted as loca
 
 - `var.R`, `var.G`, `var.B`: variance of the output values.
 - `frames`: number of frames that contributed (half float).
-- `flags` (UINT bit field): bit 0 `LOWER_BOUND`, 1 `FROM_ND`, 2 `MOVING`, 3 `FILLED`, 4 `MISSING`, 5 `INCONSISTENT`, 6 `FLOORED`, 7 `ADJACENT_CLIP_FALLBACK`, 8 `UNCOVERED`. `FROM_ND` marks any attenuated group's contribution. Repair, highlight and demosaic donors are included.
+- `flags` (UINT bit field): bit 0 `LOWER_BOUND`, 1 `FROM_ND`, 2 `MOVING`, 3 `FILLED`, 4 `MISSING`, 5 `INCONSISTENT`, 6 `FLOORED`, 7 `ADJACENT_CLIP_FALLBACK`, 8 `UNCOVERED`, 9 `RECONSTRUCTED`. `FROM_ND` marks any attenuated group's contribution. Repair, highlight and demosaic donors are included.
 - `source` (UINT): 1-based group ID in manifest order (1 for positional frames), 0 for no source, 65535 for mixed sources. RGB source IDs include repair, highlight and demosaic dependencies.
 
 `--write-cfa PATH` writes a one-channel EXR of the merged mosaic after the flat field and before repair and highlight handling, with `var` and `flags` channels and the CFA pattern as an attribute. Its source IDs describe selection before repair.

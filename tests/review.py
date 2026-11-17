@@ -160,6 +160,25 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(rgb["source"][i], 65535)
         self.assertEqual(rgb["flags"][i] & (1 | 2), 1 | 2)
 
+    def test_reconstructed_highlights_take_the_rim_colour(self):
+        # A disc clips R and G but not B. Its colour comes from the unclipped rim
+        # and its level from B, so the bounds do not decide the colour.
+        frame = self.folder / "disc.dng"
+        colour = (0.6, 0.4, 0.1)
+        # A lens-blurred profile: quads straddling a hard step would mix colours.
+        dng(frame, (1, 10), lambda y, x, c: colour[c] * (1 + 3 / (1 + (math.hypot(y - 64, x - 64) / 10) ** 2)))
+        report, rgb = self.fuse("disc", frame, "--aux", "--wb", "custom:1,1,1")
+        i = 64 * SIZE + 64
+        close(rgb["R"][i] / rgb["B"][i], 6, 0.03)
+        close(rgb["G"][i] / rgb["B"][i], 4, 0.03)
+        self.assertEqual(rgb["flags"][i] & (1 | 512), 1 | 512)
+        self.assertGreater(report["merge"]["reconstructed_fraction"], 0)
+
+        # The old neutral mode raises G to the R bound and stays available.
+        _, rgb = self.fuse("disc-neutral", frame, "--aux", "--wb", "custom:1,1,1", "--highlights", "neutral")
+        close(rgb["R"][i], rgb["G"][i])
+        self.assertEqual(rgb["flags"][i] & 512, 0)
+
     def test_variance_overflow_is_rejected_before_publication(self):
         frame = self.folder / "frame.dng"
         dng(frame, (1, 10), lambda y, x, c: 0.2)
