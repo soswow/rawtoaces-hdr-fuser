@@ -179,6 +179,46 @@ class ReviewTests(unittest.TestCase):
         close(rgb["R"][i], rgb["G"][i])
         self.assertEqual(rgb["flags"][i] & 512, 0)
 
+    def test_steep_edges_keep_their_hue(self):
+        # A small bright disc whose brightness falls about tenfold per site at
+        # the rim, like the sun. A straight average of the neighbours is
+        # dominated by the bright side and gives each site the wrong hue.
+        frame = self.folder / "sun.dng"
+        colour = (1.0, 0.6, 0.25)
+        def level(r):
+            return 0.008 * 100 ** (1 / (1 + math.exp((r - 12) / 0.7)))
+        # Low noise like a real sensor: log-space estimates need 8 σ everywhere in the window.
+        dng(frame, (1, 10), lambda y, x, c: colour[c] * level(math.hypot(y - 64.3, x - 63.6)),
+            noise=(1e-5, 6e-9))
+        true = (math.log(colour[0] / colour[1]), math.log(colour[2] / colour[1]))
+
+        def hue_errors(rgb, pixels):
+            return [max(abs(math.log(rgb["R"][i] / rgb["G"][i]) - true[0]),
+                        abs(math.log(rgb["B"][i] / rgb["G"][i]) - true[1])) for i in pixels]
+
+        report, rgb = self.fuse("sun", frame, "--aux", "--wb", "custom:1,1,1")
+        steep = [i for i in range(SIZE * SIZE) if rgb["flags"][i] & 1024]
+        self.assertGreater(len(steep), 40)
+        self.assertEqual(report["edges"]["pixels"], len(steep))
+        ratio = hue_errors(rgb, steep)
+
+        linear_report, linear = self.fuse("sun-linear", frame, "--aux", "--wb", "custom:1,1,1", "--edges", "linear")
+        self.assertEqual(linear_report["edges"]["pixels"], 0)
+        self.assertFalse(any(linear["flags"][i] & 1024 for i in range(SIZE * SIZE)))
+        straight = hue_errors(linear, steep)
+        # Hue error in log units: about 0.02 median and 0.25 at worst (inside the
+        # blend ramp) against about 0.4 and 0.95 for the straight average.
+        median = lambda values: sorted(values)[len(values) // 2]
+        self.assertLess(median(ratio), 0.05)
+        self.assertLess(max(ratio), 0.35)
+        self.assertGreater(median(straight), 0.3)
+        self.assertGreater(max(straight), 0.8)
+        # Away from the rim both modes are the same demosaic.
+        for i in (64 * SIZE + 64, 10 * SIZE + 10):
+            self.assertEqual(rgb["flags"][i] & 1024, 0)
+            for c in "RGB":
+                self.assertEqual(rgb[c][i], linear[c][i])
+
     def test_variance_overflow_is_rejected_before_publication(self):
         frame = self.folder / "frame.dng"
         dng(frame, (1, 10), lambda y, x, c: 0.2)

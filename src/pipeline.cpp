@@ -495,7 +495,10 @@ void fuse(const Options& o, Warnings& warnings) {
         {"dark_model", o.darkModel.empty() ? Json(nullptr) : Json(o.darkModel.string())},
         {"vignette", {{"source", field.source}, {"gain_maps", field.maps}, {"max_gain", rgbReport(field.maxGain)}}},
         {"groups", std::move(groupsReport)}, {"merge", stats},
-        {"demosaic", o.demosaic}, {"warnings", warnings}, {"timing_seconds", time.values}};
+        {"demosaic", o.demosaic},
+        {"edges", {{"method", o.edges}, {"pixels", output.edgePixels},
+                   {"fraction", double(output.edgePixels) / ref.layout.size()}}},
+        {"warnings", warnings}, {"timing_seconds", time.values}};
     {
         std::ofstream stream(reportFile.path(), std::ios::binary);
         stream.exceptions(std::ios::failbit | std::ios::badbit);

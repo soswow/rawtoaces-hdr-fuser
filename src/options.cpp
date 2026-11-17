@@ -71,6 +71,7 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --highlights reconstruct|neutral|bound
                                       Clipped-site estimate (reconstruct)
   --demosaic bilinear|mhc
+  --edges ratio|linear                Steep-edge interpolation (ratio)
   --allow-scene-drift                 Keep a manual group ev despite measured scene drift
   --write-cfa PATH                    Diagnostic mosaic EXR
   --aux                               Include variance, frame count and flags
@@ -101,6 +102,7 @@ Options parseOptions(int argc, char** argv) {
         {"--normalize", &Options::normalize}, {"--bad-pixels", &Options::badPixels},
         {"--noise", &Options::noise}, {"--vignette", &Options::vignette},
         {"--highlights", &Options::highlights}, {"--demosaic", &Options::demosaic},
+        {"--edges", &Options::edges},
         {"--exposures", &Options::exposures}};
     const std::unordered_map<std::string, fs::path Options::*> paths{
         {"-o", &Options::output}, {"--output", &Options::output}, {"--report", &Options::report},
@@ -165,6 +167,7 @@ Options parseOptions(int argc, char** argv) {
     oneOf("--normalize", o.normalize, {"geomean", "none"});
     oneOf("--highlights", o.highlights, {"reconstruct", "neutral", "bound"});
     oneOf("--demosaic", o.demosaic, {"bilinear", "mhc"});
+    oneOf("--edges", o.edges, {"ratio", "linear"});
     oneOf("--exposures", o.exposures, {"measured", "exif"});
     if (o.matrix.rfind("custom:", 0) == 0) {
         const auto path = o.matrix.substr(7);

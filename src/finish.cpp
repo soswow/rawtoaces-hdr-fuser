@@ -1,5 +1,6 @@
 #include "pipeline.h"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
@@ -159,6 +160,95 @@ Kernel mhc(const Layout& layout, int row, int col, int target) {
     }
     return kernel;
 }
+
+// Steep-edge interpolation. Beside a source far brighter than its surroundings,
+// such as the sun's disc, brightness can change tenfold per site; a straight-line
+// average of the neighbours is then dominated by the bright side, so the missing
+// colours at a site come out too bright for the one it measured. There the
+// estimate works in log space: green along the direction of smaller change
+// (Hamilton–Adams style, with the site's own colour correcting the curvature to
+// second order, limited to the range of its green neighbours), then red and blue
+// as that green times the neighbours' geometric-mean colour ratio (constant hue).
+// It blends in between 2× and 4× neighbour contrast and needs every site in the
+// 7 × 7 window positive and 8 σ above noise, since logs of noisy values are biased.
+constexpr double edgeStart = 0.6931471805599453, edgeFull = 1.3862943611198906;  // log 2, log 4
+constexpr double edgeSnr2 = 64;  // 8 σ
+constexpr int edgeReach = 3;
+
+struct EdgeEstimator {
+    const std::vector<Site>& sites;
+    const Layout& layout;
+
+    const Site& at(int y, int x) const {
+        return sites[layout.index(mirror(y, layout.height), mirror(x, layout.width))];
+    }
+    bool usable(const Site& s) const {
+        return !(s.flags & uncovered) && (s.flags & (missing | filled)) != missing && s.signal > 0 &&
+               double(s.signal) * s.signal >= edgeSnr2 * s.variance;
+    }
+    double log(int y, int x) const { return std::log(double(at(y, x).signal)); }
+
+    // Log-range of the taps a straight average would use, or a negative value
+    // when any of them is too dark or noisy for log-space estimates.
+    double contrast(const std::array<Kernel, 3>& kernels, int own) const {
+        double range = 0;
+        for (int c = 0; c < 3; ++c) {
+            if (c == own) continue;
+            double lo = INFINITY, hi = -INFINITY;
+            for (int i = 0; i < kernels[c].size; ++i) {
+                const auto& s = sites[kernels[c].taps[i].index];
+                if (!usable(s)) return -1;
+                lo = std::min(lo, std::log(double(s.signal)));
+                hi = std::max(hi, std::log(double(s.signal)));
+            }
+            if (kernels[c].size) range = std::max(range, hi - lo);
+        }
+        return range;
+    }
+
+    bool windowUsable(int y, int x) const {
+        for (int dy = -edgeReach; dy <= edgeReach; ++dy)
+            for (int dx = -edgeReach; dx <= edgeReach; ++dx)
+                if (!usable(at(y + dy, x + dx))) return false;
+        return true;
+    }
+
+    double logGreen(int y, int x) const {
+        const double centre = log(y, x);
+        if (layout.colour(mirror(y, layout.height), mirror(x, layout.width)) == 1) return centre;
+        double sum = 0, weights = 0, lo = INFINITY, hi = -INFINITY;
+        for (auto [a, b] : {std::pair{0, 1}, std::pair{1, 0}}) {
+            const double g0 = log(y - a, x - b), g1 = log(y + a, x + b);
+            const double c0 = log(y - 2 * a, x - 2 * b), c1 = log(y + 2 * a, x + 2 * b);
+            const double estimate = 0.5 * (g0 + g1) + 0.125 * (2 * centre - c0 - c1);
+            const double gradient = std::abs(g0 - g1) + std::abs(2 * centre - c0 - c1) + 1e-3;
+            sum += estimate / gradient;
+            weights += 1 / gradient;
+            lo = std::min({lo, g0, g1});
+            hi = std::max({hi, g0, g1});
+        }
+        return std::clamp(sum / weights, lo, hi);
+    }
+
+    double estimate(int y, int x, int target) const {
+        const double green = logGreen(y, x);
+        if (target == 1) return std::exp(green);
+        const int own = layout.colour(y, x);
+        double ratio = 0;
+        int count = 0;
+        auto add = [&](int dy, int dx) {
+            ratio += log(y + dy, x + dx) - logGreen(y + dy, x + dx);
+            ++count;
+        };
+        if (own == 1) {
+            if (layout.colour(y, x ^ 1) == target) { add(0, -1); add(0, 1); }
+            else { add(-1, 0); add(1, 0); }
+        } else {
+            for (auto p : diagonals) add(p.row, p.col);
+        }
+        return std::exp(green + ratio / count);
+    }
+};
 
 } // namespace
 
@@ -462,10 +552,11 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
             for (int c = 0; c < 3; ++c) row[c] *= colour.wb[c];
     }
 
-    const bool useMhc = o.demosaic == "mhc";
-    std::atomic<size_t> floors{0};
+    const bool useMhc = o.demosaic == "mhc", useEdges = o.edges == "ratio";
+    const EdgeEstimator edges{sites, layout};
+    std::atomic<size_t> floors{0}, edgePixels{0};
     parallelRows(layout.height, o.threads, [&](int y) {
-        size_t flooredRow = 0;
+        size_t flooredRow = 0, edgeRow = 0;
         for (int x = 0; x < layout.width; ++x) {
             const auto i = layout.index(y, x);
             if (sites[i].flags & uncovered) {
@@ -502,6 +593,27 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
                     }
                 }
                 kernels[c] = k;
+            }
+
+            // Steep edges: blend toward the log-space estimate and rescale the
+            // kernel to it, so variance keeps its relative size and provenance
+            // still comes from the same taps.
+            bool edge = false;
+            if (useEdges) {
+                const int own = layout.colour(y, x);
+                const double range = edges.contrast(kernels, own);
+                if (range > edgeStart && edges.windowUsable(y, x)) {
+                    const double weight = std::min(1.0, (range - edgeStart) / (edgeFull - edgeStart));
+                    for (int c = 0; c < 3; ++c) {
+                        if (c == own || camera[c] <= 0) continue;
+                        const double value = camera[c] + weight * (edges.estimate(y, x, c) - camera[c]);
+                        const float factor = float(value / camera[c]);
+                        for (int j = 0; j < kernels[c].size; ++j) kernels[c].taps[j].weight *= factor;
+                        camera[c] = value;
+                    }
+                    edge = true;
+                    ++edgeRow;
+                }
             }
 
             bool anyFloor = false;
@@ -552,13 +664,15 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
             flooredRow += anyFloor;
             if (o.aux) {
                 output.frames[i] = frames;
-                output.flags[i] = flags | (anyFloor ? floored : 0);
+                output.flags[i] = flags | (anyFloor ? floored : 0) | (edge ? edgeRatio : 0);
                 if (!sources.empty()) output.sources[i] = source;
             }
         }
         floors.fetch_add(flooredRow, std::memory_order_relaxed);
+        edgePixels.fetch_add(edgeRow, std::memory_order_relaxed);
     });
     output.flooredPixels = floors;
+    output.edgePixels = edgePixels;
     return output;
 }
 }
