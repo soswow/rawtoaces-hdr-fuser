@@ -128,7 +128,7 @@ Run `rawfuse --help` for all switches. The [algorithm and output reference](docs
 DNG `CFAPattern` entries are colour codes. `CFAPlaneColor` assigns those colours to
 planes, and the per-plane colour metadata is mapped to RGB, including white balance,
 noise and the rawtoaces metadata matrix. For DNGs with a non-RGB plane order, use
-`--matrix metadata` (the default), `auto`, or a custom RGB-to-AP0 matrix. Forced
+`--matrix auto` (the default), `metadata`, or a custom RGB-to-AP0 matrix. Forced
 `adobe` mode rejects that layout because LibRaw assumes green on plane 1 and can
 supply a fallback identity matrix for those files.
 

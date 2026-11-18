@@ -38,7 +38,7 @@ struct Options {
     fs::path manifest;
     std::vector<InputGroup> groups;
     fs::path output, report, writeCfa, darkModel;
-    std::string space = "aces", wb = "median", matrix = "metadata";
+    std::string space = "aces", wb = "median", matrix = "auto";
     std::string normalize = "geomean", badPixels = "dng", noise = "auto";
     std::string exposures = "measured";
     std::optional<Matrix> customMatrix;  // Parsed --matrix custom:FILE

@@ -54,7 +54,7 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --force                             Replace existing output files
   --space aces|camera                 Output colour space (aces)
   --wb reference|median|frame:N|custom:R,G,B  (median)
-  --matrix metadata|auto|spectral|adobe|custom:FILE
+  --matrix auto|metadata|spectral|adobe|custom:FILE  (auto)
   --normalize geomean|none
   --floor F                           Positive minimum in output units (off by default)
   --reference auto|N                  Frame number in the first group (positional order)
