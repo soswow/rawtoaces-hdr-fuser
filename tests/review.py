@@ -383,6 +383,47 @@ class ReviewTests(unittest.TestCase):
         # Clean blocked samples outside the mask are kept.
         self.assertEqual(rgb["source"][64 * SIZE + 20], 1)
 
+    def test_alignment_measures_sub_pixel_shifts_within_and_between_groups(self):
+        size = 256
+        rng = random.Random(7)
+        # Texture down to a 12-site wavelength, as lens blur leaves it. Finer detail,
+        # near the quad grid's limit, biases a shift by a few hundredths of a site.
+        waves = [(rng.uniform(0, 2 * math.pi), rng.uniform(12, 48), rng.uniform(0, math.pi), rng.uniform(0.3, 1))
+                 for _ in range(12)]
+        norm = sum(w[3] for w in waves)
+        def scene(y, x):  # Rate at the (1, 10) exposure
+            texture = sum(a * math.sin(2 * math.pi * (x * math.cos(t) + y * math.sin(t)) / l + p)
+                          for p, l, t, a in waves) / norm
+            return 0.1 * (1 + 0.8 * texture)
+        def frame(name, exposure, scale, shift):
+            path = self.folder / name
+            dy, dx = shift
+            dng(path, exposure, lambda y, x, c: scale * scene(y - dy, x - dx), width=size, height=size)
+            return path.name
+        # Group a: the (1, 10) frame is the reference; the long frame moved.
+        a = [frame("a1.dng", (1, 40), 0.25, (0, 0)), frame("a2.dng", (1, 10), 1, (0, 0)),
+             frame("a3.dng", (1, 3), 10 / 3, (0.3, -0.2))]
+        # Group b, a second bracket after the camera was bumped.
+        b = [frame("b1.dng", (1, 10), 1, (0.7, -1.3)), frame("b2.dng", (1, 3), 10 / 3, (0.7, -1.3))]
+        manifest = self.folder / "groups.json"
+        manifest.write_text(json.dumps({"groups": [{"name": "a", "frames": a}, {"name": "b", "frames": b}]}))
+        report, _ = self.fuse("aligned", "--groups", manifest, "--no-deghost")
+        frames = {(f["group"], f["input"]): f for f in report["alignment"]["frames"]}
+        self.assertTrue(frames[("a", 2)]["reference"])
+        expected = {("a", 1): (0, 0), ("a", 3): (0.3, -0.2), ("b", 1): (0.7, -1.3), ("b", 2): (0.7, -1.3)}
+        for key, (dy, dx) in expected.items():
+            f = frames[key]
+            self.assertTrue(f["aligned"], key)
+            self.assertIn("aligned_to", f, key)
+            close(f["shift"]["rows"], dy, 0.02)
+            close(f["shift"]["cols"], dx, 0.02)
+            self.assertLess(f["max_shift"] - math.hypot(dy, dx), 0.05, key)
+            close(f["gain_ev"], 0, 0.02)
+        self.assertFalse(report["alignment"]["applied"])
+        self.assertIn("the merge does not compensate motion yet", " ".join(report["warnings"]))
+        report, _ = self.fuse("unaligned", "--groups", manifest, "--align", "off")
+        self.assertIsNone(report["alignment"])
+
     def test_status_lines_and_quiet(self):
         frame = self.folder / "status.dng"
         dng(frame, (1, 10), lambda y, x, c: 0.2)

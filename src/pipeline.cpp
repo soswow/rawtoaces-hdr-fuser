@@ -335,6 +335,85 @@ void reportBrackets(const Status& status, const FrameGroups& frames, const Prepa
     status(line.str());
 }
 
+std::string frameName(const FrameGroups& frames, const FrameAlignment& a, const Options& o) {
+    return o.groups[a.group].name + " #" + std::to_string((*frames[a.group])[a.frame].inputIndex + 1);
+}
+
+Json alignmentReport(const Alignment& alignment, const FrameGroups& frames, const Options& o) {
+    if (alignment.frames.empty()) return nullptr;
+    Json list = Json::array();
+    for (const auto& a : alignment.frames) {
+        Json entry{{"group", o.groups[a.group].name}, {"input", (*frames[a.group])[a.frame].inputIndex + 1},
+                   {"reference", a.reference}, {"aligned", a.aligned}, {"coverage", a.coverage}};
+        // An unconstrained estimate is reported for diagnosis but not used.
+        if (a.unconstrained && !a.inherited) entry["unconstrained"] = true;
+        if ((a.aligned || a.unconstrained) && !a.reference) {
+            const auto& parent = alignment.frames[a.alignedTo];
+            entry[a.inherited ? "inherited_from" : "aligned_to"] = {
+                {"group", o.groups[parent.group].name},
+                {"input", (*frames[parent.group])[parent.frame].inputIndex + 1}};
+            entry["shift"] = {{"rows", a.shift[0]}, {"cols", a.shift[1]}};
+            entry["shift_uncertainty"] = a.uncertainty;
+            entry["median_shift"] = a.medianShift;
+            entry["max_shift"] = a.maxShift;
+            if (!a.inherited) {
+                entry["overlap"] = a.overlap;
+                entry["gain_ev"] = a.gainEv;
+                entry["residual_scale"] = a.residualScale;
+                entry["model_rms"] = a.modelRms;
+                entry["roll_mrad"] = a.roll;
+            }
+            entry["tiles"] = {{"rows", a.field.tileRows}, {"cols", a.field.tileCols},
+                              {"size", a.field.tileSites}, {"inliers", a.inlierTiles},
+                              {"dy", a.field.dy}, {"dx", a.field.dx}, {"measured", a.field.measured},
+                              {"scene", a.field.scene}};
+        }
+        list.push_back(std::move(entry));
+    }
+    return {{"method", "tile-translation"}, {"applied", false}, {"frames", std::move(list)}};
+}
+
+void reportAlignment(const Status& status, const Alignment& alignment, const FrameGroups& frames,
+                     const Options& o, Warnings& warnings) {
+    const auto root = std::find_if(alignment.frames.begin(), alignment.frames.end(),
+                                   [](const auto& a) { return a.reference; });
+    if (root == alignment.frames.end()) return;
+    size_t moved = 0;
+    for (size_t g = 0; g < frames.size(); ++g) {
+        const FrameAlignment* largest = nullptr;
+        size_t measured = 0, inherited = 0, unaligned = 0;
+        for (const auto& a : alignment.frames) {
+            if (a.group != g || a.reference) continue;
+            if (!a.aligned) {
+                ++unaligned;
+                continue;
+            }
+            a.inherited ? ++inherited : ++measured;
+            moved += std::hypot(a.shift[0], a.shift[1]) > 0.5;
+            if (!largest || std::hypot(a.shift[0], a.shift[1]) > std::hypot(largest->shift[0], largest->shift[1]))
+                largest = &a;
+        }
+        if (!largest) {
+            if (unaligned)
+                status(o.groups[g].name + ": motion unconstrained on all " + std::to_string(unaligned) +
+                       " frames (too few consistent tiles)");
+            continue;
+        }
+        std::ostringstream line;
+        line << o.groups[g].name << ": motion against " << frameName(frames, *root, o) << " measured on "
+             << measured << (measured == 1 ? " frame" : " frames");
+        if (inherited) line << " (" << inherited << " more take a neighbour's)";
+        if (unaligned) line << ", " << unaligned << " unconstrained";
+        line << "; largest shift " << fixed(std::hypot(largest->shift[0], largest->shift[1]), 2)
+             << " px (" << frameName(frames, *largest, o) << ": rows " << fixed(largest->shift[0], 2)
+             << ", cols " << fixed(largest->shift[1], 2) << ")";
+        status(line.str());
+    }
+    if (moved)
+        warnings.push_back(std::to_string(moved) + (moved == 1 ? " frame is" : " frames are") +
+                           " shifted by more than 0.5 px; the merge does not compensate motion yet");
+}
+
 void reportComposition(const Status& status, const std::vector<GroupResult>& results, double scale,
                        const Options& o) {
     for (size_t g = 0; g < results.size(); ++g) {
@@ -414,6 +493,12 @@ void fuse(const Options& o, Warnings& warnings) {
     const auto preparation = prepareFrames(frames, *sidecars, o, warnings);
     time.mark("prepare");
     reportBrackets(status, frames, preparation, o);
+    Alignment alignment;
+    if (o.align != "off" && (frames.size() > 1 || plain.size() > 1)) {
+        alignment = estimateAlignment(frames, findReference(plain, o), o, warnings);
+        time.mark("align");
+        reportAlignment(status, alignment, frames, o, warnings);
+    }
     if (o.verbose) std::cerr << "Merging Bayer samples\n";
     auto composition = mergeGroups(frames, *sidecars, o, warnings);
     auto merge = std::move(composition.mosaic);
@@ -494,7 +579,8 @@ void fuse(const Options& o, Warnings& warnings) {
         {"output_floor", o.outputFloor > 0 ? Json(o.outputFloor) : Json(nullptr)},
         {"dark_model", o.darkModel.empty() ? Json(nullptr) : Json(o.darkModel.string())},
         {"vignette", {{"source", field.source}, {"gain_maps", field.maps}, {"max_gain", rgbReport(field.maxGain)}}},
-        {"groups", std::move(groupsReport)}, {"merge", stats},
+        {"groups", std::move(groupsReport)}, {"alignment", alignmentReport(alignment, frames, o)},
+        {"merge", stats},
         {"demosaic", o.demosaic},
         {"edges", {{"method", o.edges}, {"pixels", output.edgePixels},
                    {"fraction", double(output.edgePixels) / ref.layout.size()}}},

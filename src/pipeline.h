@@ -43,7 +43,7 @@ struct Options {
     std::string exposures = "measured";
     std::optional<Matrix> customMatrix;  // Parsed --matrix custom:FILE
     std::string vignette = "dng", highlights = "reconstruct", demosaic = "bilinear";
-    std::string edges = "ratio";
+    std::string edges = "ratio", align = "report";
     double outputFloor = 0;
     int reference = 0, clipDilate = 1;
     unsigned threads = 1;
@@ -206,6 +206,41 @@ struct SiteMerge {
     bool shadow = false;
 };
 SiteMerge mergeSite(const std::vector<RawFrame>&, int row, int col, const Options&);
+// Frame of a bracket the merge uses as its motion and deghosting reference.
+size_t findReference(const std::vector<RawFrame>&, const Options&);
+
+// Motion of a frame against the global reference (docs/ALIGNMENT.md): the
+// reference site (row, col) is seen at (row, col) + at(row, col) in the frame.
+// Displacements are per tile, in sites, bilinear between tile centres. The
+// field is camera motion: tiles whose estimate agrees with the frame's rigid
+// camera model keep it, the others take the model.
+struct MotionField {
+    int tileRows = 0, tileCols = 0, tileSites = 128;
+    std::vector<float> dy, dx, std;  // std: translation uncertainty of measured tiles
+    std::vector<uint8_t> measured;   // The tile's own estimate is used
+    std::vector<uint8_t> scene;      // Departs from the model coherently with its neighbours
+    std::array<double, 2> at(double row, double col) const;
+};
+struct FrameAlignment {
+    size_t group = 0, frame = 0;      // Position in the exposure-sorted groups
+    size_t alignedTo = 0;             // Index into Alignment::frames
+    bool reference = false, aligned = false;
+    bool inherited = false;           // Too little overlap: motion of alignedTo, same bracket
+    bool unconstrained = false;       // Estimated, but too few consistent tiles to trust
+    size_t coverage = 0, overlap = 0, measuredTiles = 0, inlierTiles = 0;
+    std::array<double, 2> shift{};    // Global translation, sites (rows, columns)
+    double gainEv = 0;                // Log2 rate ratio against the reference
+    double residualScale = 0, uncertainty = 0, medianShift = 0, maxShift = 0;
+    double modelRms = 0;             // Inlier tiles' departure from the rigid camera model
+    double roll = 0;                  // Rotation about the frame centre, milliradians
+    MotionField field;
+};
+struct Alignment { std::vector<FrameAlignment> frames; };
+// `reference` indexes the first group's exposure-sorted frames.
+Alignment estimateAlignment(const FrameGroups&, size_t reference, const Options&, Warnings&);
+// Harmonic fill of unknown grid cells from known ones (groups.cpp).
+void membrane(std::vector<double>& value, const std::vector<uint8_t>& known, int rows, int cols,
+              std::vector<uint8_t>& reached);
 
 struct BlockCheck { int row, col; RGB ev; std::array<size_t, 3> samples; bool flagged; };
 struct NDResult {

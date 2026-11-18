@@ -35,6 +35,8 @@ double quad(const RawFrame& frame, int row, int col, const Options& o) {
     return sum / (4 * frame.effective);
 }
 
+} // namespace
+
 size_t findReference(const std::vector<RawFrame>& frames, const Options& o) {
     if (o.reference) {
         const auto it = std::find_if(frames.begin(), frames.end(), [&](const RawFrame& f) {
@@ -57,8 +59,6 @@ size_t findReference(const std::vector<RawFrame>& frames, const Options& o) {
     }
     return selected;
 }
-
-} // namespace
 
 SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const Options& o) {
     const auto& first = frames.front();

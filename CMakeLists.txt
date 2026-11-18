@@ -15,7 +15,7 @@ find_package(nlohmann_json 3.9 CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
 add_library(rawfuse_pipeline STATIC
-    src/options.cpp src/metadata.cpp src/raw_frame.cpp src/dark_model.cpp src/merge.cpp
+    src/options.cpp src/metadata.cpp src/raw_frame.cpp src/dark_model.cpp src/merge.cpp src/align.cpp
     src/bracket.cpp src/nd.cpp src/groups.cpp src/finish.cpp src/colour.cpp src/writer.cpp src/pipeline.cpp)
 target_compile_features(rawfuse_pipeline PUBLIC cxx_std_17)
 target_compile_definitions(rawfuse_pipeline PUBLIC RAWFUSE_VERSION="${PROJECT_VERSION}")

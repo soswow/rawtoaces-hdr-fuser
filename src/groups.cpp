@@ -64,6 +64,35 @@ bool precise(const Site& site) {
            site.variance < matchRelativeVariance * double(site.signal) * site.signal;
 }
 
+struct OffsetField {
+    int rows = 0, cols = 0;
+    std::array<std::vector<double>, 3> value;
+    std::array<std::vector<uint8_t>, 3> reached;
+
+    // Bilinear between cell centres; false where no cell nearby was reached.
+    bool at(int y, int x, int colour, double& offset) const {
+        const double fy = std::clamp((y + 0.5) / matchCell - 0.5, 0.0, double(rows - 1));
+        const double fx = std::clamp((x + 0.5) / matchCell - 0.5, 0.0, double(cols - 1));
+        const int r0 = int(fy), c0 = int(fx);
+        const int r1 = std::min(r0 + 1, rows - 1), c1 = std::min(c0 + 1, cols - 1);
+        const double wy = fy - r0, wx = fx - c0;
+        const int rs[] = {r0, r0, r1, r1}, cs[] = {c0, c1, c0, c1};
+        const double ws[] = {(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx};
+        double sum = 0, weight = 0;
+        for (int k = 0; k < 4; ++k) {
+            const size_t i = size_t(rs[k]) * cols + cs[k];
+            if (!reached[colour][i]) continue;
+            sum += ws[k] * value[colour][i];
+            weight += ws[k];
+        }
+        if (weight <= 1e-9) return false;
+        offset = sum / weight;
+        return true;
+    }
+};
+
+} // namespace
+
 // Membrane (harmonic) interpolation: unknown cells take the average of their
 // neighbours, with known cells fixed. Cells in a component without a known cell
 // stay unreached.
@@ -108,35 +137,6 @@ void membrane(std::vector<double>& value, const std::vector<uint8_t>& known, int
         if (change < tolerance) break;
     }
 }
-
-struct OffsetField {
-    int rows = 0, cols = 0;
-    std::array<std::vector<double>, 3> value;
-    std::array<std::vector<uint8_t>, 3> reached;
-
-    // Bilinear between cell centres; false where no cell nearby was reached.
-    bool at(int y, int x, int colour, double& offset) const {
-        const double fy = std::clamp((y + 0.5) / matchCell - 0.5, 0.0, double(rows - 1));
-        const double fx = std::clamp((x + 0.5) / matchCell - 0.5, 0.0, double(cols - 1));
-        const int r0 = int(fy), c0 = int(fx);
-        const int r1 = std::min(r0 + 1, rows - 1), c1 = std::min(c0 + 1, cols - 1);
-        const double wy = fy - r0, wx = fx - c0;
-        const int rs[] = {r0, r0, r1, r1}, cs[] = {c0, c1, c0, c1};
-        const double ws[] = {(1 - wy) * (1 - wx), (1 - wy) * wx, wy * (1 - wx), wy * wx};
-        double sum = 0, weight = 0;
-        for (int k = 0; k < 4; ++k) {
-            const size_t i = size_t(rs[k]) * cols + cs[k];
-            if (!reached[colour][i]) continue;
-            sum += ws[k] * value[colour][i];
-            weight += ws[k];
-        }
-        if (weight <= 1e-9) return false;
-        offset = sum / weight;
-        return true;
-    }
-};
-
-} // namespace
 
 std::vector<InputGroup> readGroups(const fs::path& path) {
     try {

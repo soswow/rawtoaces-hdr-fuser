@@ -58,6 +58,7 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --normalize geomean|none
   --floor F                           Positive minimum in output units (off by default)
   --reference auto|N                  Frame number in the first group (positional order)
+  --align report|off                  Estimate motion between frames and report it (report)
   --no-deghost                        Disable motion rejection
   --deghost-ev EV                     Motion threshold (1)
   --bad-pixels dng|none|FILE           Defect list or DNG opcodes
@@ -102,7 +103,7 @@ Options parseOptions(int argc, char** argv) {
         {"--normalize", &Options::normalize}, {"--bad-pixels", &Options::badPixels},
         {"--noise", &Options::noise}, {"--vignette", &Options::vignette},
         {"--highlights", &Options::highlights}, {"--demosaic", &Options::demosaic},
-        {"--edges", &Options::edges},
+        {"--edges", &Options::edges}, {"--align", &Options::align},
         {"--exposures", &Options::exposures}};
     const std::unordered_map<std::string, fs::path Options::*> paths{
         {"-o", &Options::output}, {"--output", &Options::output}, {"--report", &Options::report},
@@ -168,6 +169,7 @@ Options parseOptions(int argc, char** argv) {
     oneOf("--highlights", o.highlights, {"reconstruct", "neutral", "bound"});
     oneOf("--demosaic", o.demosaic, {"bilinear", "mhc"});
     oneOf("--edges", o.edges, {"ratio", "linear"});
+    oneOf("--align", o.align, {"report", "off"});
     oneOf("--exposures", o.exposures, {"measured", "exif"});
     if (o.matrix.rfind("custom:", 0) == 0) {
         const auto path = o.matrix.substr(7);
