@@ -1,8 +1,10 @@
 """Regressions found during the full pipeline review; no external Python packages."""
 
+import calendar
 import json
 import itertools
 import math
+import os
 from pathlib import Path
 import random
 import struct
@@ -219,6 +221,45 @@ class ReviewTests(unittest.TestCase):
             for c in "RGB":
                 self.assertEqual(rgb[c][i], linear[c][i])
 
+    def seam(self, frame, name, selected, *args):
+        # A second group with identical data that replaces only `selected` sites:
+        # values stay the same, provenance must follow what each estimate read.
+        copy = self.folder / ("copy-" + frame.name)
+        copy.write_bytes(frame.read_bytes())
+        mask = self.folder / (name + ".pgm")
+        mask.write_bytes(f"P5\n{SIZE} {SIZE}\n255\n".encode() +
+                         bytes(255 if selected(y, x) else 0 for y in range(SIZE) for x in range(SIZE)))
+        manifest = self.folder / (name + "-groups.json")
+        manifest.write_text(json.dumps({"groups": [
+            {"name": "first", "frames": [frame.name]},
+            {"name": "second", "frames": [copy.name], "contribution_mask": mask.name, "match": "none"}]}))
+        return self.fuse(name, "--groups", manifest, "--aux", *args)
+
+    def test_edge_estimate_sources_include_every_site_it_read(self):
+        frame = self.folder / "sun.dng"
+        colour = (1.0, 0.6, 0.25)
+        level = lambda r: 0.008 * 100 ** (1 / (1 + math.exp((r - 12) / 0.7)))
+        dng(frame, (1, 10), lambda y, x, c: colour[c] * level(math.hypot(y - 64.3, x - 63.6)),
+            noise=(1e-5, 6e-9))
+        column = 52  # The disc's left rim
+        _, rgb = self.seam(frame, "edge-seam", lambda y, x: x == column, "--wb", "custom:1,1,1")
+        # Bilinear taps reach one column; the log-space estimate reads two or three.
+        beside = [y * SIZE + column + 2 for y in range(SIZE) if rgb["flags"][y * SIZE + column + 2] & 1024]
+        self.assertGreater(len(beside), 3)
+        for i in beside:
+            self.assertEqual(rgb["source"][i], 65535)
+
+    def test_reconstructed_highlight_sources_include_the_rim(self):
+        frame = self.folder / "disc.dng"
+        colour = (0.6, 0.4, 0.1)
+        dng(frame, (1, 10), lambda y, x, c: colour[c] * (1 + 3 / (1 + (math.hypot(y - 64, x - 64) / 10) ** 2)))
+        # Only the unclipped rim, which sets the disc's colour, comes from the second group.
+        _, rgb = self.seam(frame, "rim-seam", lambda y, x: 20 <= math.hypot(y - 64, x - 64) <= 30,
+                           "--wb", "custom:1,1,1")
+        i = 64 * SIZE + 64
+        self.assertEqual(rgb["flags"][i] & (1 | 512), 1 | 512)
+        self.assertEqual(rgb["source"][i], 65535)
+
     def test_variance_overflow_is_rejected_before_publication(self):
         frame = self.folder / "frame.dng"
         dng(frame, (1, 10), lambda y, x, c: 0.2)
@@ -242,13 +283,26 @@ class ReviewTests(unittest.TestCase):
         manifest.write_text(json.dumps({"groups": [
             {"name": "short", "frames": [short.name]}, {"name": "long", "frames": [long.name]}]}))
         report, rgb = self.fuse("bounds", "--groups", manifest, "--aux", "--highlights", "bound")
-        # Clipping at 1/1000 s bounds the rate at 1000 per second; the later
-        # 1/10 s bound (10 per second) is weaker and must not replace it.
+        # Clipping at 1/1000 s bounds the rate at 999 per second (the default
+        # 0.001 clip margin); the later 1/10 s bound is weaker and must not replace it.
         i = 10 * SIZE + 10
-        close(rgb["R"][i], 1)
+        close(rgb["R"][i], 0.999)
         self.assertEqual(rgb["source"][i], 1)
         self.assertEqual(rgb["flags"][i] & 1, 1)
         self.assertEqual(report["groups"][0]["lower_bound_sites"], SIZE * SIZE)
+
+    def test_clipped_bound_is_the_clipping_threshold(self):
+        # A reading at 95% of range clipped by a 10% margin is known only to be at
+        # least 90%, and a reading at the white level likewise.
+        for level in (0.95, 1):
+            with self.subTest(level=level):
+                frame = self.folder / "margin.dng"
+                dng(frame, (1, 1), lambda y, x, c: level)
+                _, rgb = self.fuse("margin", frame, "--force", "--aux", "--highlights", "bound",
+                                   "--clip-margin", "0.10")
+                i = 10 * SIZE + 10
+                close(rgb["G"][i], 0.9)
+                self.assertEqual(rgb["flags"][i] & 1, 1)
 
     def test_sidecars_fail_before_remaining_frames_with_warnings(self):
         good, broken = self.folder / "good.dng", self.folder / "broken.dng"
@@ -284,6 +338,42 @@ class ReviewTests(unittest.TestCase):
         i = 12 * SIZE + 10
         self.assertEqual(rgb["flags"][i] & (8 | 16), 8 | 16)
         self.assertTrue(any("no capture time" in w for w in report["warnings"]))
+
+    def test_dated_defects_use_the_capture_utc_offset(self):
+        # Captured 2026-01-02 03:04:05 camera time; the defect dates from 00:00 UTC that day.
+        bad = self.folder / "dated.txt"
+        bad.write_text(f"10 12 {calendar.timegm((2026, 1, 2, 0, 0, 0))}\n")
+        i = 12 * SIZE + 10
+
+        def run(name, offset, *args, zone="UTC"):
+            frame = self.folder / (name + ".dng")
+            dng(frame, (1, 10), lambda y, x, c: 0.2, offset=offset)
+            output = self.folder / (name + ".exr")
+            result = subprocess.run([EXE, "--space", "camera", "--aux", "--bad-pixels", str(bad), *args,
+                                     str(frame), "-o", str(output)], capture_output=True, text=True,
+                                    env={**os.environ, "TZ": zone})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(output.with_suffix(".json").read_text())
+            return report, bool(read_exr(output)[1]["flags"][i] & 16)
+
+        # Without an offset the time is unknown wherever rawfuse runs: the entry applies.
+        for zone in ("UTC", "Australia/Sydney"):
+            report, excluded = run("plain-" + zone.replace("/", "-"), None, zone=zone)
+            self.assertTrue(excluded)
+            self.assertIsNone(report["inputs"][0]["capture_utc"])
+            self.assertTrue(any("no capture time with a known UTC offset" in w for w in report["warnings"]))
+        report, excluded = run("utc", None, "--camera-timezone", "+00:00", zone="Australia/Sydney")
+        self.assertTrue(excluded)
+        self.assertEqual(report["inputs"][0]["capture_time_source"], "camera_timezone")
+        self.assertEqual(report["inputs"][0]["capture_utc"], calendar.timegm((2026, 1, 2, 3, 4, 5)))
+        # At +10:00 the frame was taken the previous afternoon, before the defect.
+        _, excluded = run("sydney", None, "--camera-timezone", "+10:00")
+        self.assertFalse(excluded)
+        # The file's own offset wins over the option.
+        report, excluded = run("exif", b"+10:00\0", "--camera-timezone", "+00:00")
+        self.assertFalse(excluded)
+        self.assertEqual(report["inputs"][0]["capture_time_source"], "exif_offset")
+        self.fuse("bad-zone", self.folder / "exif.dng", "--camera-timezone", "10", error="--camera-timezone expects")
 
     def test_frames_use_their_own_black_levels(self):
         # LibRaw measures some cameras' black level per frame (Canon CR3 varies by
@@ -359,10 +449,29 @@ class ReviewTests(unittest.TestCase):
                 i = y * SIZE + x
                 self.assertEqual(rgb["source"][i], 2)
                 close(rgb["G"][i], scene(y, x), 0.01)
+        self.assertEqual(match["status"], "corrected")
         report, rgb = self.fuse("veil-kept", "--groups", write("none"), "--aux")
         self.assertIsNone(report["groups"][1]["offset_match"])
         i = 40 * SIZE + 61
         close(rgb["G"][i], scene(40, 61) + veil(40, 61), 0.005)
+
+    def test_offset_match_without_overlap_reports_uncorrected_sites(self):
+        _, _, blocked, open_, mask = self.stick_brackets()
+        manifest = self.folder / "groups.json"
+        manifest.write_text(json.dumps({"groups": [
+            {"name": "left", "frames": [blocked.name], "valid_mask": mask("left.pgm", lambda x: x < SIZE // 2)},
+            {"name": "right", "frames": [open_.name], "valid_mask": mask("right.pgm", lambda x: x >= SIZE // 2)}]}))
+        output = self.folder / "disjoint.exr"
+        result = subprocess.run([EXE, "--space", "camera", "--groups", str(manifest), "-o", str(output)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        match = json.loads(output.with_suffix(".json").read_text())["groups"][1]["offset_match"]
+        self.assertEqual(match["status"], "no_overlap")
+        self.assertEqual(match["corrected_sites"], 0)
+        self.assertEqual(match["unresolved_sites"], SIZE * SIZE // 2)
+        self.assertEqual(match["anchored"], {"R": False, "G": False, "B": False})
+        self.assertIn("no precise overlap with earlier groups in R, G, B; 8,192 inserted sites not corrected",
+                      result.stderr)
 
     def test_contribution_mask_group_also_fills_gaps_outside_the_mask(self):
         scene, veil, blocked, open_, mask = self.stick_brackets()
@@ -407,7 +516,7 @@ class ReviewTests(unittest.TestCase):
         b = [frame("b1.dng", (1, 10), 1, (0.7, -1.3)), frame("b2.dng", (1, 3), 10 / 3, (0.7, -1.3))]
         manifest = self.folder / "groups.json"
         manifest.write_text(json.dumps({"groups": [{"name": "a", "frames": a}, {"name": "b", "frames": b}]}))
-        report, _ = self.fuse("aligned", "--groups", manifest, "--no-deghost")
+        report, _ = self.fuse("aligned", "--groups", manifest, "--no-deghost", "--align", "report")
         frames = {(f["group"], f["input"]): f for f in report["alignment"]["frames"]}
         self.assertTrue(frames[("a", 2)]["reference"])
         expected = {("a", 1): (0, 0), ("a", 3): (0.3, -0.2), ("b", 1): (0.7, -1.3), ("b", 2): (0.7, -1.3)}
@@ -421,8 +530,40 @@ class ReviewTests(unittest.TestCase):
             close(f["gain_ev"], 0, 0.02)
         self.assertFalse(report["alignment"]["applied"])
         self.assertIn("the merge does not compensate motion yet", " ".join(report["warnings"]))
-        report, _ = self.fuse("unaligned", "--groups", manifest, "--align", "off")
+        report, _ = self.fuse("unaligned", "--groups", manifest)
         self.assertIsNone(report["alignment"])
+
+    def test_nd_gate_counts_distinct_sites(self):
+        # Repeated filtered frames of one small patch add observations, not coverage.
+        base = self.folder / "base.dng"
+        dng(base, (1, 10), lambda y, x, c: 0.2)
+
+        def square(name, side):
+            path = self.folder / name
+            path.write_bytes(f"P5\n{SIZE} {SIZE}\n255\n".encode() + bytes(
+                255 if y < side and x < side else 0 for y in range(SIZE) for x in range(SIZE)))
+            return path.name
+
+        def manifest(count, side):
+            frames = []
+            for k in range(count):
+                frame = self.folder / f"nd{k}.dng"
+                dng(frame, (1, 10), lambda y, x, c: 0.2 / 8)
+                frames.append(frame.name)
+            path = self.folder / "groups.json"
+            path.write_text(json.dumps({"groups": [
+                {"name": "clear", "frames": [base.name]},
+                {"name": "nd", "frames": frames, "ev": "auto", "valid_mask": square(f"sq{side}.pgm", side),
+                 "match": "none"}]}))
+            return path
+
+        self.fuse("one", "--groups", manifest(1, 32), error="256/512/256 distinct usable sites")
+        self.fuse("nine", "--groups", manifest(9, 32), error="256/512/256 distinct usable sites")
+        report, _ = self.fuse("wide", "--groups", manifest(2, 96))
+        calibration = report["groups"][1]["calibration"]
+        self.assertEqual(calibration["sites"], {"R": 2304, "G": 4608, "B": 2304})
+        self.assertEqual(calibration["samples"], {"R": 4608, "G": 9216, "B": 4608})
+        close(report["groups"][1]["ev"]["G"], 3, 0.01)
 
     def test_status_lines_and_quiet(self):
         frame = self.folder / "status.dng"
@@ -435,10 +576,19 @@ class ReviewTests(unittest.TestCase):
                      "rawfuse: result: 0% of sites missing", "rawfuse: wrote " + str(output)):
             self.assertIn(line, result.stderr)
         self.assertEqual(result.stdout, "")
-        result = subprocess.run([EXE, "-q", "--force", str(frame), "-o", str(output)],
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(all(line.startswith("rawfuse: warning:") for line in result.stderr.splitlines()))
+        # The synthetic camera has no spectral data, so auto falls back to metadata;
+        # that is reported, not printed under -q, and -q wins over -v.
+        self.assertIn("rawfuse: colour: --matrix auto uses the metadata solver", result.stderr)
+        report = json.loads(output.with_suffix(".json").read_text())
+        self.assertEqual(report["matrix"]["method"], "auto")
+        self.assertEqual(report["matrix"]["resolved"], "metadata")
+        self.assertTrue(report["matrix"]["fallback_reason"])
+        for extra in ([], ["-v"], ["--matrix", "metadata", "-v"]):
+            result = subprocess.run([EXE, "-q", *extra, "--force", str(frame), "-o", str(output)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(all(line.startswith("rawfuse: warning:") for line in result.stderr.splitlines()),
+                            result.stderr)
 
     def test_measured_exposure_ratio_replaces_rounded_exif(self):
         # The long frame's real exposure is 0.1 EV longer than its EXIF label.

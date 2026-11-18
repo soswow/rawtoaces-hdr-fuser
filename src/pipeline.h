@@ -38,18 +38,19 @@ struct Options {
     fs::path manifest;
     std::vector<InputGroup> groups;
     fs::path output, report, writeCfa, darkModel;
-    std::string space = "aces", wb = "median", matrix = "metadata";
+    std::string space = "aces", wb = "median", matrix = "auto";
     std::string normalize = "geomean", badPixels = "dng", noise = "auto";
     std::string exposures = "measured";
     std::optional<Matrix> customMatrix;  // Parsed --matrix custom:FILE
     std::string vignette = "dng", highlights = "reconstruct", demosaic = "bilinear";
-    std::string edges = "ratio", align = "report";
+    std::string edges = "ratio", align = "off";
     double outputFloor = 0;
     int reference = 0, clipDilate = 1;
     unsigned threads = 1;
     double deghostEv = 1, darkModelError = 0.10, low = 0.0083, high = 0.88;
     double clipMargin = 0.001;
     std::vector<double> noiseOverride;  // Parsed --noise S,O
+    std::optional<int> cameraOffset;  // --camera-timezone, seconds east of UTC
     bool deghost = true, aux = false, force = false, verbose = false, quiet = false, allowSceneDrift = false;
 };
 
@@ -65,6 +66,7 @@ struct GainMap {
 
 struct Metadata {
     std::string exposure, description, xmp, captureDate;
+    std::string captureOffset;  // EXIF OffsetTimeOriginal (or OffsetTime), e.g. "+10:00"
     double seconds = 0, iso = 0, aperture = 0, baseline = 0;
     std::optional<RGB> neutral;
     std::optional<Rect> activeArea;
@@ -107,7 +109,11 @@ struct RawFrame {
     bool dng = false, hasWB = false;
     Matrix cameraToSRGB{};
     size_t inputIndex = 0;
+    // The recorded capture date and time, in seconds as if it were UTC, and the
+    // UTC capture time once a UTC offset is known (0: unknown).
+    std::optional<long long> wallClock;
     long long captureTimestamp = 0;
+    std::string captureTimeSource;  // "exif_offset", "camera_timezone" or empty
     std::shared_ptr<const void> mosaicOwner;
     const uint16_t* mosaic = nullptr;
     std::vector<uint8_t> rejected;
@@ -127,6 +133,8 @@ struct RawFrame {
 };
 
 RawFrame readRaw(const fs::path&, Warnings&);
+// "+HH:MM", "-HH:MM", "+HHMM", "+HH", "Z" or "UTC" as seconds east of UTC.
+std::optional<int> parseUtcOffset(const std::string&);
 using FrameGroups = std::vector<std::vector<RawFrame>*>;
 using Mask = std::vector<uint8_t>;
 double validateFrames(const FrameGroups&, Warnings&);
@@ -188,6 +196,7 @@ struct Site {
 enum class SampleState { usable, aboveHigh, clipped, adjacentClip, missing };
 struct Sample {
     SampleState state;
+    // For a clipped sample: the clipping threshold, a lower bound on the signal.
     float fraction = 0, extra = 0;
 };
 
@@ -245,7 +254,7 @@ void membrane(std::vector<double>& value, const std::vector<uint8_t>& known, int
 struct BlockCheck { int row, col; RGB ev; std::array<size_t, 3> samples; bool flagged; };
 struct NDResult {
     RGB ev{}, measured{}, mad{};
-    std::array<size_t, 3> samples{};
+    std::array<size_t, 3> samples{}, sites{};  // Frame observations and distinct sites per colour
     std::optional<double> sceneDrift;
     size_t sceneDriftSamples = 0;
     std::vector<BlockCheck> blocks;
@@ -263,6 +272,11 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
 struct OffsetMatch {
     size_t samples = 0, knownCells = 0, corrected = 0, unresolved = 0, capped = 0;
     RGB median{}, share{};  // Applied offset and its share of the uncorrected signal (medians)
+    // A field needs an anchor cell in every colour; without one nothing is corrected.
+    std::array<bool, 3> anchored{};
+    // "no_sites" (the group inserted nothing), "no_overlap" (a colour has no
+    // anchor), "partial" (some inserted sites lie beyond the field) or "corrected".
+    std::string status;
 };
 
 struct GroupResult {
@@ -294,6 +308,10 @@ void repairSites(std::vector<Site>&, const Layout&, const RGB&, const Options&,
 struct Colour {
     RGB wb = unitWB;
     std::optional<Matrix> matrix;
+    // The solver rawtoaces used ("spectral", "metadata", ...): --matrix auto
+    // resolves to one of the first two. fallback says why auto chose metadata.
+    std::string method, fallback;
+    std::vector<std::string> databases;  // Spectral database search path
 };
 Colour configureColour(const std::vector<RawFrame>&, size_t, const Options&, Warnings&);
 struct Output {

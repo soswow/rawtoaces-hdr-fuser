@@ -315,11 +315,11 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
             });
             OffsetMatch match;
             for (const size_t n : rowSamples) match.samples += n;
-            for (int c = 0; c < 3; ++c)
+            for (int c = 0; c < 3; ++c) {
                 for (const auto k : known[c]) match.knownCells += k;
-            if (std::all_of(known.begin(), known.end(), [](const auto& k) {
-                return std::find(k.begin(), k.end(), 1) != k.end();
-            })) {
+                match.anchored[c] = std::find(known[c].begin(), known[c].end(), 1) != known[c].end();
+            }
+            if (std::all_of(match.anchored.begin(), match.anchored.end(), [](bool a) { return a; })) {
                 for (int c = 0; c < 3; ++c) membrane(f.value[c], known[c], f.rows, f.cols, f.reached[c]);
                 field = std::move(f);
             }
@@ -330,7 +330,10 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
             size_t corrected = 0, unresolved = 0, capped = 0;
             std::array<std::vector<float>, 3> offset, share;
         };
-        std::vector<RowMatch> rowMatch(field ? layout.height : 0);
+        // Inserted sites are counted whenever matching is on, also when no field
+        // could be built, so the report shows what stayed uncorrected.
+        const bool matching = groupResult.match.has_value();
+        std::vector<RowMatch> rowMatch(matching ? layout.height : 0);
         parallelRows(layout.height, o.threads, [&](int y) {
             for (int x = 0; x < layout.width; ++x) {
                 const size_t i = layout.index(y, x);
@@ -379,7 +382,7 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                 current = site;
                 result.sources[i] = uint32_t(g + 1);
                 shadows[i] = contribution.shadowSites[i];
-                if (!field) continue;
+                if (!matching) continue;
                 auto& row = rowMatch[y];
                 if (!resolved) {
                     ++row.unresolved;
@@ -391,7 +394,7 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                 if (uncorrected > 0) row.share[colour].push_back(float(offset / uncorrected));
             }
         });
-        if (field) {
+        if (matching) {
             auto& match = *groupResult.match;
             std::array<std::vector<double>, 3> offsets, shares;
             for (auto& row : rowMatch) {
@@ -407,6 +410,8 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                 if (!offsets[c].empty()) match.median[c] = median(offsets[c]);
                 if (!shares[c].empty()) match.share[c] = median(shares[c]);
             }
+            match.status = !match.corrected && !match.unresolved ? "no_sites" :
+                           !field ? "no_overlap" : match.unresolved ? "partial" : "corrected";
         }
         for (size_t r = 0; r <= g; ++r)
             if (lastUse[r] == g) releaseMosaics(*frames[r]);

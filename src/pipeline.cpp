@@ -163,6 +163,8 @@ Json inputReport(const RawFrame& f, const char* role) {
             {"exposure_correction_ev", std::log2(f.effective / f.exifEffective)},
             {"as_shot_neutral", m.neutral ? Json(*m.neutral) : Json(nullptr)},
             {"image_description", m.description}, {"xmp", m.xmp}, {"capture_date", m.captureDate},
+            {"capture_utc", f.captureTimestamp ? Json(f.captureTimestamp) : Json(nullptr)},
+            {"capture_time_source", f.captureTimeSource.empty() ? Json(nullptr) : Json(f.captureTimeSource)},
             {"baseline_exposure", m.baseline}, {"noise_profile", noiseReport(f)},
             {"optical_black_sigma_dn", optionalNumber(f.opticalBlackSigma)},
             {"black_level", f.blackPattern}, {"white_level", f.white},
@@ -221,6 +223,7 @@ Json calibrationReport(const NDResult& nd, bool manual, const InputGroup& group)
     return {{"method", manual ? "manual" : "auto"}, {"ev", rgbReport(nd.ev)},
             {"measured_ev", rgbReport(nd.measured)}, {"mad_ev", rgbReport(nd.mad)},
             {"samples", {{"R", nd.samples[0]}, {"G", nd.samples[1]}, {"B", nd.samples[2]}}},
+            {"sites", {{"R", nd.sites[0]}, {"G", nd.sites[1]}, {"B", nd.sites[2]}}},
             {"blocks_flagged", std::move(flagged)}, {"blocks", std::move(blocks)},
             {"scene_drift_ev", nd.sceneDrift ? Json(*nd.sceneDrift) : Json(nullptr)},
             {"scene_drift_samples", nd.sceneDriftSamples},
@@ -231,7 +234,8 @@ Json calibrationReport(const NDResult& nd, bool manual, const InputGroup& group)
 Json matchReport(const std::optional<OffsetMatch>& match, double scale) {
     if (!match) return nullptr;
     const RGB median{match->median[0] * scale, match->median[1] * scale, match->median[2] * scale};
-    return {{"overlap_samples", match->samples}, {"known_cells", match->knownCells},
+    return {{"status", match->status}, {"overlap_samples", match->samples}, {"known_cells", match->knownCells},
+            {"anchored", {{"R", match->anchored[0]}, {"G", match->anchored[1]}, {"B", match->anchored[2]}}},
             {"corrected_sites", match->corrected}, {"unresolved_sites", match->unresolved},
             {"capped_sites", match->capped},
             {"median_offset", rgbReport(median)}, {"median_share", rgbReport(match->share)}};
@@ -287,10 +291,14 @@ std::string percent(double fraction) {
 }
 
 // Progress and outcome lines on stderr; --quiet keeps only warnings and errors.
+// -v adds per-frame and per-stage detail; -q overrides it.
 struct Status {
     const Options& o;
     void operator()(const std::string& line) const {
         if (!o.quiet) std::cerr << "rawfuse: " << line << '\n';
+    }
+    void detail(const std::string& line) const {
+        if (o.verbose && !o.quiet) std::cerr << "rawfuse: " << line << '\n';
     }
 };
 
@@ -424,8 +432,8 @@ void reportComposition(const Status& status, const std::vector<GroupResult>& res
             std::ostringstream line;
             line << spec.name << ": " << (spec.ev ? "ev " + evText(nd.ev) + " (manual), checked against "
                                                  : "ev " + evText(nd.ev) + " measured against ")
-                 << spec.calibrationReference << " on " << grouped(nd.samples[0]) << "/" << grouped(nd.samples[1])
-                 << "/" << grouped(nd.samples[2]) << " R/G/B sites";
+                 << spec.calibrationReference << " on " << grouped(nd.sites[0]) << "/" << grouped(nd.sites[1])
+                 << "/" << grouped(nd.sites[2]) << " R/G/B sites";
             if (spec.ev) line << " (measured " << evText(nd.measured) << ")";
             if (nd.sceneDrift) line << "; scene drift " << fixed(*nd.sceneDrift, 2) << " EV";
             status(line.str());
@@ -440,9 +448,14 @@ void reportComposition(const Status& status, const std::vector<GroupResult>& res
             const auto& m = *result.match;
             std::ostringstream match;
             match << spec.name << ": ";
-            if (!m.corrected && !m.unresolved) match << "offset match: nothing to correct";
-            else if (!m.knownCells) match << "offset match: no precise overlap with earlier groups; not corrected";
-            else {
+            if (m.status == "no_sites") match << "offset match: the group inserted no sites, nothing to correct";
+            else if (m.status == "no_overlap") {
+                std::string colours;
+                for (int c = 0; c < 3; ++c)
+                    if (!m.anchored[c]) colours += std::string(colours.empty() ? "" : ", ") + "RGB"[c];
+                match << "offset match: no precise overlap with earlier groups in " << colours << "; "
+                      << grouped(m.unresolved) << " inserted sites not corrected";
+            } else {
                 match << "offset matched to earlier groups from " << grouped(m.samples)
                       << " overlap sites; subtracted a median " << std::setprecision(3) << m.median[1] * scale
                       << " (G, camera RGB at output scale), " << fixed(100 * m.share[1], 0) << "% of its signal, at "
@@ -467,7 +480,7 @@ void fuse(const Options& o, Warnings& warnings) {
     std::optional<Sidecars> sidecars;
     auto read = [&](const std::vector<fs::path>& files, std::vector<RawFrame>& frames) {
         for (const auto& file : files) {
-            if (o.verbose) std::cerr << "Reading " << file.string() << '\n';
+            status.detail("reading " + file.string());
             auto frame = readRaw(file, warnings);
             frame.inputIndex = frames.size();
             frames.push_back(std::move(frame));
@@ -499,7 +512,7 @@ void fuse(const Options& o, Warnings& warnings) {
         time.mark("align");
         reportAlignment(status, alignment, frames, o, warnings);
     }
-    if (o.verbose) std::cerr << "Merging Bayer samples\n";
+    status.detail("merging Bayer samples");
     auto composition = mergeGroups(frames, *sidecars, o, warnings);
     auto merge = std::move(composition.mosaic);
     auto sources = std::move(composition.sources);
@@ -516,6 +529,9 @@ void fuse(const Options& o, Warnings& warnings) {
     const auto colour = configureColour(plain, merge.reference, o, warnings);
     const auto spread = whiteBalanceSpread(plain, warnings);
     time.mark("colour_setup");
+    if (o.matrix == "auto" && !colour.method.empty())
+        status("colour: --matrix auto uses the " + colour.method + " solver" +
+               (colour.fallback.empty() ? "" : " (" + colour.fallback + ")"));
     if (o.vignette == "dng" && std::any_of(frames.begin(), frames.end(), [&](const auto* group) {
         return std::any_of(group->begin(), group->end(), [&](const auto& frame) {
             return frame.metadata.maps != ref.metadata.maps;
@@ -534,7 +550,7 @@ void fuse(const Options& o, Warnings& warnings) {
         time.mark("write_cfa");
     }
     repairSites(merge.sites, ref.layout, colour.wb, o, sources);
-    if (o.verbose) std::cerr << "Demosaicing and converting colour\n";
+    status.detail("demosaicing and converting colour");
     const auto output = render(merge.sites, ref.layout, colour, scale, o, sources);
     time.mark("render");
 
@@ -572,7 +588,11 @@ void fuse(const Options& o, Warnings& warnings) {
         {"cfa", ref.layout.pattern()}, {"make", ref.make}, {"model", ref.model},
         {"space", o.space == "aces" ? "aces-ap0" : "camera"},
         {"white_balance", {{"method", o.wb}, {"multipliers", colour.wb}, {"spread_across_frames", spread}}},
-        {"matrix", {{"method", o.matrix}, {"values", colour.matrix ? Json(*colour.matrix) : Json(nullptr)}}},
+        {"matrix", {{"method", o.matrix},
+                    {"resolved", colour.method.empty() ? Json(nullptr) : Json(colour.method)},
+                    {"fallback_reason", colour.fallback.empty() ? Json(nullptr) : Json(colour.fallback)},
+                    {"spectral_database", colour.databases},
+                    {"values", colour.matrix ? Json(*colour.matrix) : Json(nullptr)}}},
         {"exposure_reference", scale}, {"reference_f_number", referenceAperture},
         {"exposures", o.exposures},
         {"noise_profile", noiseReport(ref)}, {"noise_fits", noiseFitsReport(preparation.noiseFits)},

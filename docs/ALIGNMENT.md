@@ -97,7 +97,7 @@ most valid quads. Each later group is tied to the earlier ones by its single
 best-overlapping pair (up to four candidates are tried), then grows inside
 itself. Fields compose by addition, `d_k ≈ d_a + d_ka`.
 
-**Output.** `--align report` (the default) estimates and reports; `off` skips
+**Output.** `--align off` (the default) skips the estimate, so output stays as before; `report` estimates and reports
 it. The JSON `alignment` block lists per frame its parent, global shift and
 uncertainty, roll, log-gain (`gain_ev`), residual scale, model RMS and the tile
 grid (`dy`, `dx`, `measured`, `scene`). `applied` is false: nothing is warped

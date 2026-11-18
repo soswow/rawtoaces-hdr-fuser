@@ -41,6 +41,7 @@ void headerAttributes(exr::Header& header, const RawFrame& reference, const Colo
             for (int j = 0; j < 3; ++j) values[i][j] = float((*colour.matrix)[i][j]);
         header.insert("rawfuse:matrix", exr::M33fAttribute(values));
     }
+    if (!colour.method.empty()) header.insert("rawfuse:matrixMethod", exr::StringAttribute(colour.method));
     header.insert("rawfuse:report", exr::StringAttribute(o.report.filename().string()));
     if (o.space == "aces") {
         exr::addChromaticities(header, exr::Chromaticities(
