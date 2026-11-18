@@ -6,4 +6,3 @@ __pycache__/
 /tests/real_captures.py
 /.claude/
 /.codex-attachments/
-/CODEBASE_REVIEW.md
