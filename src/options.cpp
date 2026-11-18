@@ -73,7 +73,7 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --vignette dng|none|FILE             DNG gain maps or float flat-field EXR
   --highlights reconstruct|neutral|bound
                                       Clipped-site estimate (reconstruct)
-  --demosaic bilinear|mhc
+  --demosaic bilinear|mhc|splat       Merge then demosaic, or merge every colour at each pixel (bilinear)
   --edges ratio|linear                Steep-edge interpolation (ratio)
   --allow-scene-drift                 Keep a manual group ev despite measured scene drift
   --write-cfa PATH                    Diagnostic mosaic EXR
@@ -176,7 +176,7 @@ Options parseOptions(int argc, char** argv) {
     oneOf("--space", o.space, {"aces", "camera"});
     oneOf("--normalize", o.normalize, {"geomean", "none"});
     oneOf("--highlights", o.highlights, {"reconstruct", "neutral", "bound"});
-    oneOf("--demosaic", o.demosaic, {"bilinear", "mhc"});
+    oneOf("--demosaic", o.demosaic, {"bilinear", "mhc", "splat"});
     oneOf("--edges", o.edges, {"ratio", "linear"});
     oneOf("--align", o.align, {"off", "report", "apply"});
     oneOf("--exposures", o.exposures, {"measured", "exif"});

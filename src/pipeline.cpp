@@ -258,7 +258,7 @@ Json mergeReport(const MergeResult& merge, const Output& output) {
             {"shadow_fraction", merge.shadow / size}, {"unsupported_fraction", unsupported / size},
             {"adjacent_clip_fallback_fraction", adjacent / size},
             {"uncovered_fraction", outside / size}, {"reconstructed_fraction", rebuilt / size},
-            {"floored_fraction", output.flooredPixels / size}};
+            {"floored_fraction", output.flooredPixels / double(output.rgb.size() / 3)}};
 }
 
 std::string grouped(size_t n) {
@@ -544,7 +544,15 @@ void fuse(const Options& o, Warnings& warnings) {
         time.mark("align");
         reportAlignment(status, alignment, frames, o, applied, warnings);
     }
-    status.detail("merging Bayer samples");
+    const bool splat = o.demosaic == "splat";
+    // The reference frame's flat field. Interpolated reads (moved frames, the
+    // full-colour merge) scale each site by its own gain.
+    FlatField field;
+    const auto gains = std::make_shared<const std::vector<float>>(siteGains(plain[findReference(plain, o)], o, field));
+    if (!gains->empty() && (splat || o.align == "apply"))
+        for (auto* group : frames)
+            for (auto& frame : *group) frame.gains = gains;
+    status.detail(splat ? "merging every colour at each pixel" : "merging Bayer samples");
     auto composition = mergeGroups(frames, *sidecars, o, warnings);
     auto merge = std::move(composition.mosaic);
     auto sources = std::move(composition.sources);
@@ -569,7 +577,7 @@ void fuse(const Options& o, Warnings& warnings) {
             return frame.metadata.maps != ref.metadata.maps;
         });
     })) warnings.push_back("input frames carry differing GainMaps; applying the reference frame maps");
-    const auto field = flatField(merge.sites, ref, o);
+    applyFlatField(merge.sites, ref.layout, *gains, field, o);
     for (const auto& site : merge.sites)
         if (!std::isfinite(site.signal) || !std::isfinite(site.variance))
             throw std::runtime_error("merged CFA signal or variance overflows float32");
@@ -578,11 +586,23 @@ void fuse(const Options& o, Warnings& warnings) {
     std::unique_ptr<StagedFile> cfaFile;
     if (!o.writeCfa.empty()) {
         cfaFile = std::make_unique<StagedFile>(o.writeCfa);
-        writeCfa(cfaFile->path(), ref.layout, merge.sites, o, sources);
+        if (splat) {
+            // The full-colour merge at each site's own colour.
+            const auto& layout = ref.layout;
+            std::vector<Site> mosaic(layout.size());
+            std::vector<uint32_t> mosaicSources(sources.empty() ? 0 : layout.size());
+            for (int y = 0; y < layout.height; ++y)
+                for (int x = 0; x < layout.width; ++x) {
+                    const size_t i = layout.index(y, x), j = i * 3 + size_t(layout.colour(y, x));
+                    mosaic[i] = merge.sites[j];
+                    if (!sources.empty()) mosaicSources[i] = sources[j];
+                }
+            writeCfa(cfaFile->path(), layout, mosaic, o, mosaicSources);
+        } else writeCfa(cfaFile->path(), ref.layout, merge.sites, o, sources);
         time.mark("write_cfa");
     }
     repairSites(merge.sites, ref.layout, colour.wb, o, sources);
-    status.detail("demosaicing and converting colour");
+    status.detail(splat ? "converting colour" : "demosaicing and converting colour");
     const auto output = render(merge.sites, ref.layout, colour, scale, o, sources);
     time.mark("render");
 
@@ -634,7 +654,7 @@ void fuse(const Options& o, Warnings& warnings) {
         {"groups", std::move(groupsReport)}, {"alignment", alignmentReport(alignment, o)},
         {"merge", stats},
         {"demosaic", o.demosaic},
-        {"edges", {{"method", o.edges}, {"pixels", output.edgePixels},
+        {"edges", {{"method", splat ? "none" : o.edges}, {"pixels", output.edgePixels},
                    {"fraction", double(output.edgePixels) / ref.layout.size()}}},
         {"warnings", warnings}, {"timing_seconds", time.values}};
     {

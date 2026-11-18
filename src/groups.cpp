@@ -230,11 +230,17 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
         for (size_t r = 0; r < frames.size(); ++r)
             if (o.groups[r].name == o.groups[g].calibrationReference) lastUse[r] = std::max(lastUse[r], g);
     }
+    // The mosaic has one site per pixel; the full-colour merge (--demosaic
+    // splat) three, pixel-major. Masks are per pixel.
+    const size_t channels = o.demosaic == "splat" ? 3 : 1;
+    auto colourOf = [&](int y, int x, size_t channel) {
+        return channels == 1 ? layout.colour(y, x) : int(channel);
+    };
     GroupMerge result;
     result.groups.resize(frames.size());
-    result.sources.resize(layout.size());
-    result.mosaic.sites.resize(layout.size(), {0, 0, uint16_t(missing | uncovered), 0});
-    Mask shadows(layout.size());
+    result.sources.resize(layout.size() * channels);
+    result.mosaic.sites.resize(layout.size() * channels, {0, 0, uint16_t(missing | uncovered), 0});
+    Mask shadows(layout.size() * channels);
     Options automaticReference = o;
     automaticReference.reference = 0;
     for (size_t g = 0; g < frames.size(); ++g) {
@@ -266,7 +272,9 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
         // earlier groups measured worse.
         const auto& contributionMask = sidecars.contribution[g];
         const auto& selection = validity[g];
-        auto contribution = mergePlain(*frames[g], g ? automaticReference : o, selection, true);
+        const auto& options = g ? automaticReference : o;
+        auto contribution = channels == 1 ? mergePlain(*frames[g], options, selection, true)
+                                          : mergeSplat(*frames[g], options, selection, true);
         if (!g) result.mosaic.reference = contribution.reference;
         RGB gain = unitWB;
         for (int c = 0; c < 3; ++c) gain[c] = std::exp2(groupResult.ev[c]);
@@ -294,18 +302,25 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                     for (int x = 0; x < layout.width; ++x) {
                         const size_t i = layout.index(y, x);
                         if ((!selection.empty() && !selection[i]) || replacesAt(i)) continue;
-                        const auto& before = result.mosaic.sites[i];
-                        const auto& site = contribution.sites[i];
-                        if (!precise(before) || !precise(site)) continue;
-                        const int colour = layout.colour(y, x);
-                        const double factor = attenuated ? gain[colour] : 1;
-                        samples[x / matchCell][colour].push_back(float(site.signal * factor - before.signal));
+                        for (size_t channel = 0; channel < channels; ++channel) {
+                            const size_t j = i * channels + channel;
+                            const auto& before = result.mosaic.sites[j];
+                            const auto& site = contribution.sites[j];
+                            if (!precise(before) || !precise(site)) continue;
+                            const int colour = colourOf(y, x, channel);
+                            const double factor = attenuated ? gain[colour] : 1;
+                            samples[x / matchCell][colour].push_back(float(site.signal * factor - before.signal));
+                        }
                     }
                 for (int c = 0; c < f.cols; ++c)
                     for (int colour = 0; colour < 3; ++colour) {
                         auto& values = samples[c][colour];
                         rowSamples[cellRow] += values.size();
-                        if (values.size() < matchMinimum) continue;
+                        // A full-colour merge has a sample of each colour at every pixel,
+                        // interpolated from a quarter (red, blue) or half (green) as many
+                        // sites; the minimum counts sites, as in the mosaic.
+                        const size_t perSite = channels == 1 ? 1 : colour == 1 ? 2 : 4;
+                        if (values.size() < matchMinimum * perSite) continue;
                         const size_t cell = size_t(cellRow) * f.cols + c;
                         auto middle = values.begin() + values.size() / 2;
                         std::nth_element(values.begin(), middle, values.end());
@@ -335,11 +350,12 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
         const bool matching = groupResult.match.has_value();
         std::vector<RowMatch> rowMatch(matching ? layout.height : 0);
         parallelRows(layout.height, o.threads, [&](int y) {
-            for (int x = 0; x < layout.width; ++x) {
-                const size_t i = layout.index(y, x);
+            for (int x = 0; x < layout.width; ++x)
+            for (size_t channel = 0; channel < channels; ++channel) {
+                const size_t i = layout.index(y, x), j = i * channels + channel;
                 if (!selection.empty() && !selection[i]) continue;
-                auto& current = result.mosaic.sites[i];
-                auto site = contribution.sites[i];
+                auto& current = result.mosaic.sites[j];
+                auto site = contribution.sites[j];
                 const bool replaces = replacesAt(i);
                 const int rank = quality(site), held = quality(current);
                 if (rank < held || (rank == held && rank > 1 && !replaces)) continue;
@@ -347,7 +363,7 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                     current = site;
                     continue;
                 }
-                const int colour = layout.colour(y, x);
+                const int colour = colourOf(y, x, channel);
                 if (attenuated) {
                     const double factor = gain[colour];
                     site.signal = float(site.signal * factor);
@@ -380,8 +396,8 @@ GroupMerge mergeGroups(const FrameGroups& frames, const Sidecars& sidecars,
                     site.flags |= inconsistent;
                 }
                 current = site;
-                result.sources[i] = uint32_t(g + 1);
-                shadows[i] = contribution.shadowSites[i];
+                result.sources[j] = uint32_t(g + 1);
+                shadows[j] = contribution.shadowSites[j];
                 if (!matching) continue;
                 auto& row = rowMatch[y];
                 if (!resolved) {

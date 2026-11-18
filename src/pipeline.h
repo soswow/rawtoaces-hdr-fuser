@@ -124,6 +124,9 @@ struct RawFrame {
     // With --align apply: where this frame sees each reference site. sample()
     // then reads the frame through it; null reads the frame's own sites.
     std::shared_ptr<const MotionField> motion;
+    // Per-site flat-field gains, attached when frames are interpolated (--align
+    // apply or --demosaic splat): sampleAt scales each site by its own gain.
+    std::shared_ptr<const std::vector<float>> gains;
 
     uint16_t raw(int row, int col) const { return mosaic[size_t(row) * stride + col]; }
     float black(int row, int col) const {
@@ -205,12 +208,22 @@ struct Sample {
     // Σw² of the sites a motion-compensated sample interpolates: the factor on
     // their shot and read noise (1 for a site read directly).
     float spread = 1;
+    // Weighted spread of the interpolated sites' fractions about the sample,
+    // Σw·(f − f̄)²: noise plus the scene detail the interpolation smooths over.
+    float detail = 0;
 };
 
 // Each frame uses its own black and white levels; they may differ within a bracket.
 // A frame with a motion field is read at the reference site's position in it,
 // interpolated over the sites of the same colour (docs/ALIGNMENT.md, stage 2).
 Sample sample(const RawFrame&, int row, int col, size_t index, const Options&);
+// The frame at position (y, x), interpolated over the sites of the colour of
+// site (row, col), which only fixes the colour lattice and may lie outside it.
+// With gains attached to the frame, sites are scaled by their gain over `gain`.
+Sample sampleAt(const RawFrame&, double y, double x, int row, int col, const Options&, double gain = 0);
+// Per-site gains interpolated at a pixel for a colour, with the bilinear
+// demosaic's taps: the gain a full-colour site carries.
+double latticeGain(const std::vector<float>& gains, const Layout&, int row, int col, int colour);
 struct MergeResult {
     std::vector<Site> sites;
     size_t reference = 0;
@@ -226,6 +239,15 @@ struct SiteMerge {
 SiteMerge mergeSite(const std::vector<RawFrame>&, int row, int col, const Options&);
 // Frame of a bracket the merge uses as its motion and deghosting reference.
 size_t findReference(const std::vector<RawFrame>&, const Options&);
+// Quads where a frame departs from the reference by more than --deghost-ev
+// (empty when deghosting is off), and whether a site is within a quad of one.
+Mask motionQuads(const std::vector<RawFrame>&, size_t reference, const Options&);
+bool nearMotion(const Mask& motion, const Layout&, int row, int col);
+// With --demosaic splat: every frame's samples of each colour interpolated at
+// each pixel through its motion and merged there (docs/ALIGNMENT.md, stage 3).
+// Sites are full-colour, three per pixel (pixel-major).
+MergeResult mergeSplat(const std::vector<RawFrame>&, const Options&, const Mask& selection = {},
+                       bool trackShadow = false);
 
 // Motion of a frame against the global reference (docs/ALIGNMENT.md): the
 // reference site (row, col) is seen at (row, col) + at(row, col) in the frame.
@@ -311,7 +333,11 @@ struct FlatField {
     size_t maps = 0;
     RGB maxGain = unitWB;
 };
-FlatField flatField(std::vector<Site>&, const RawFrame&, const Options&);
+// Per-site gains from the reference frame's GainMaps or a flat-field EXR (empty
+// when there are none), and their application to merged sites.
+std::vector<float> siteGains(const RawFrame& ref, const Options&, FlatField&);
+void applyFlatField(std::vector<Site>&, const Layout&, const std::vector<float>& gains, FlatField&,
+                    const Options&);
 void repairSites(std::vector<Site>&, const Layout&, const RGB&, const Options&,
                  std::vector<uint32_t>& sources);
 

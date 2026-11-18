@@ -603,22 +603,23 @@ Sample siteSample(const RawFrame& frame, int row, int col, size_t index, const O
 
 } // namespace
 
-// A motion-compensated sample is bilinear over the four sites of the reference
-// site's colour around its position in the frame; no other colour is mixed in.
-// Red and blue sites form a square lattice of pitch 2. Green sites form a
-// quincunx, a square lattice of pitch 2 in u = row + col, v = row − col. A
-// position on a site reads that site alone, so zero motion reads the frame as
-// without alignment.
+// A motion-compensated sample is bilinear over the four sites of one colour
+// around a position in the frame; no other colour is mixed in. Red and blue
+// sites form a square lattice of pitch 2. Green sites form a quincunx, a square
+// lattice of pitch 2 in u = row + col, v = row − col. A position on a site reads
+// that site alone, so zero motion reads the frame as without alignment.
 //
 // The state is the most conservative of the sites used: any missing site
 // (outside the frame or its validity, a defect) makes the sample missing, so
 // masks erode rather than blend; any clipped site makes it a lower bound, the
 // weighted sum of the clipped sites' thresholds and the others' readings.
-Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
-    if (!frame.motion) return siteSample(frame, row, col, index, o);
+//
+// With flat-field gains attached, each site is scaled by its gain relative to
+// `gain`, the caller's gain for this pixel and colour: a moved frame saw the
+// scene point through other sites, with their own vignetting.
+Sample sampleAt(const RawFrame& frame, double y, double x, int row, int col, const Options& o, double gain) {
     const auto& layout = frame.layout;
-    const auto d = frame.motion->at(row, col);
-    const double y = row + d[0], x = col + d[1];
+    const bool scaled = frame.gains && gain > 0;
     const int colour = layout.colour(row, col);
     struct Tap { int row, col; double weight; };
     std::array<Tap, 4> taps;
@@ -641,24 +642,59 @@ Sample sample(const RawFrame& frame, int row, int col, size_t index, const Optio
     for (const auto& tap : taps)
         if (tap.weight > 1e-6) total += tap.weight;
     double fraction = 0, extra = 0, spread = 0;
+    std::array<double, 4> values{}, weights{};
     bool clipped = false, above = false, adjacent = false;
-    for (const auto& tap : taps) {
+    // A position outside the frame was not seen. Inside it, sites beyond the
+    // edge mirror back about the first or last site, as in the demosaic; the
+    // mirror keeps their colour.
+    if (y < 0 || x < 0 || y > layout.height - 1 || x > layout.width - 1) return {SampleState::missing};
+    auto mirror = [](int p, int limit) { return p < 0 ? -p : p >= limit ? 2 * (limit - 1) - p : p; };
+    for (size_t k = 0; k < taps.size(); ++k) {
+        auto& tap = taps[k];
         if (tap.weight <= 1e-6) continue;
+        tap.row = mirror(tap.row, layout.height);
+        tap.col = mirror(tap.col, layout.width);
         if (tap.row < 0 || tap.col < 0 || tap.row >= layout.height || tap.col >= layout.width)
             return {SampleState::missing};
-        const auto s = siteSample(frame, tap.row, tap.col, layout.index(tap.row, tap.col), o);
+        const size_t index = layout.index(tap.row, tap.col);
+        const auto s = siteSample(frame, tap.row, tap.col, index, o);
         if (s.state == SampleState::missing) return {SampleState::missing};
         clipped |= s.state == SampleState::clipped;
         above |= s.state == SampleState::aboveHigh;
         adjacent |= s.state == SampleState::adjacentClip;
-        const double w = tap.weight / total;
-        fraction += w * s.fraction;
-        extra += w * w * s.extra;
+        const double w = tap.weight / total, relative = scaled ? (*frame.gains)[index] / gain : 1;
+        fraction += w * relative * s.fraction;
+        extra += w * w * relative * relative * s.extra;
         spread += w * w;
+        values[k] = relative * s.fraction;
+        weights[k] = w;
     }
     if (clipped) return {SampleState::clipped, float(fraction)};
     const auto state = adjacent ? SampleState::adjacentClip
                      : above || fraction > o.high ? SampleState::aboveHigh : SampleState::usable;
-    return {state, float(fraction), float(extra), float(spread)};
+    double detail = 0;
+    for (size_t k = 0; k < taps.size(); ++k) detail += weights[k] * (values[k] - fraction) * (values[k] - fraction);
+    return {state, float(fraction), float(extra), float(spread), float(detail)};
+}
+
+Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
+    if (!frame.motion) return siteSample(frame, row, col, index, o);
+    const auto d = frame.motion->at(row, col);
+    return sampleAt(frame, row + d[0], col + d[1], row, col, o, frame.gains ? (*frame.gains)[index] : 0);
+}
+
+double latticeGain(const std::vector<float>& gains, const Layout& layout, int row, int col, int colour) {
+    const int own = layout.colour(row, col);
+    auto at = [&](int y, int x) {
+        y = y < 0 ? -y : y >= layout.height ? 2 * (layout.height - 1) - y : y;
+        x = x < 0 ? -x : x >= layout.width ? 2 * (layout.width - 1) - x : x;
+        return double(gains[layout.index(y, x)]);
+    };
+    if (own == colour) return at(row, col);
+    if (own == 1)
+        return layout.colour(row, col ^ 1) == colour ? (at(row, col - 1) + at(row, col + 1)) / 2
+                                                     : (at(row - 1, col) + at(row + 1, col)) / 2;
+    if (colour == 1) return (at(row - 1, col) + at(row + 1, col) + at(row, col - 1) + at(row, col + 1)) / 4;
+    return (at(row - 1, col - 1) + at(row - 1, col + 1) + at(row + 1, col - 1) + at(row + 1, col + 1)) / 4;
 }
 }

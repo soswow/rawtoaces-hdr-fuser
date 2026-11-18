@@ -185,17 +185,20 @@ class ReviewTests(unittest.TestCase):
         colour = (0.6, 0.4, 0.1)
         # A lens-blurred profile: quads straddling a hard step would mix colours.
         dng(frame, (1, 10), lambda y, x, c: colour[c] * (1 + 3 / (1 + (math.hypot(y - 64, x - 64) / 10) ** 2)))
-        report, rgb = self.fuse("disc", frame, "--aux", "--wb", "custom:1,1,1")
-        i = 64 * SIZE + 64
-        close(rgb["R"][i] / rgb["B"][i], 6, 0.03)
-        close(rgb["G"][i] / rgb["B"][i], 4, 0.03)
-        self.assertEqual(rgb["flags"][i] & (1 | 512), 1 | 512)
-        self.assertGreater(report["merge"]["reconstructed_fraction"], 0)
+        for demosaic in ("bilinear", "splat"):
+            with self.subTest(demosaic=demosaic):
+                report, rgb = self.fuse("disc-" + demosaic, frame, "--aux", "--wb", "custom:1,1,1", "--demosaic", demosaic)
+                i = 64 * SIZE + 64
+                close(rgb["R"][i] / rgb["B"][i], 6, 0.03)
+                close(rgb["G"][i] / rgb["B"][i], 4, 0.03)
+                self.assertEqual(rgb["flags"][i] & (1 | 512), 1 | 512)
+                self.assertGreater(report["merge"]["reconstructed_fraction"], 0)
 
-        # The old neutral mode raises G to the R bound and stays available.
-        _, rgb = self.fuse("disc-neutral", frame, "--aux", "--wb", "custom:1,1,1", "--highlights", "neutral")
-        close(rgb["R"][i], rgb["G"][i])
-        self.assertEqual(rgb["flags"][i] & 512, 0)
+                # The old neutral mode raises G to the R bound and stays available.
+                _, rgb = self.fuse("disc-neutral-" + demosaic, frame, "--aux", "--wb", "custom:1,1,1", "--highlights", "neutral",
+                                   "--demosaic", demosaic)
+                close(rgb["R"][i], rgb["G"][i])
+                self.assertEqual(rgb["flags"][i] & 512, 0)
 
     def test_steep_edges_keep_their_hue(self):
         # A small bright disc whose brightness falls about tenfold per site at
@@ -310,12 +313,12 @@ class ReviewTests(unittest.TestCase):
     def test_clipped_bound_is_the_clipping_threshold(self):
         # A reading at 95% of range clipped by a 10% margin is known only to be at
         # least 90%, and a reading at the white level likewise.
-        for level in (0.95, 1):
-            with self.subTest(level=level):
+        for level, demosaic in itertools.product((0.95, 1), ("bilinear", "splat")):
+            with self.subTest(level=level, demosaic=demosaic):
                 frame = self.folder / "margin.dng"
                 dng(frame, (1, 1), lambda y, x, c: level)
                 _, rgb = self.fuse("margin", frame, "--force", "--aux", "--highlights", "bound",
-                                   "--clip-margin", "0.10")
+                                   "--clip-margin", "0.10", "--demosaic", demosaic)
                 i = 10 * SIZE + 10
                 close(rgb["G"][i], 0.9)
                 self.assertEqual(rgb["flags"][i] & 1, 1)
@@ -564,6 +567,53 @@ class ReviewTests(unittest.TestCase):
         # Deghosting compares the aligned frames and finds nothing moving.
         report, _ = fused("deghosted", "--align", "apply")
         self.assertEqual(report["merge"]["moving_fraction"], 0)
+
+    def coloured_frames(self, size, shifts, step=1):
+        """Frames of an independent texture per colour, each `shifts[k]` sites
+        away and `step` times shorter than the last. The noise profile matches
+        the noise-free data, so interpolation error, not noise, decides the weights."""
+        textures = [textured_scene(seed) for seed in (7, 8, 9)]
+        scene = lambda y, x, c: (0.8, 1.2, 0.6)[c] * textures[c](y, x)
+        frames = []
+        for k, (dy, dx) in enumerate(shifts):
+            path = self.folder / f"c{k}.dng"
+            dng(path, (1, 10 * step ** k), lambda y, x, c, dy=dy, dx=dx, k=k: scene(y - dy, x - dx, c) / step ** k,
+                width=size, height=size, noise=(2e-7, 1e-9))
+            frames.append(path)
+        return scene, frames
+
+    def test_splat_without_motion_matches_merge_and_demosaic(self):
+        size = 64
+        _, frames = self.coloured_frames(size, [(0, 0)] * 3, step=4)
+        report, splat = self.fuse("splat", *frames, "--demosaic", "splat", "--aux")
+        _, mosaic = self.fuse("mosaic", *frames, "--edges", "linear", "--aux")
+        self.assertEqual(report["demosaic"], "splat")
+        self.assertEqual(report["edges"]["method"], "none")
+        self.assertEqual(report["merge"]["missing_fraction"], 0)
+        for c in "RGB":
+            for i in range(size * size):
+                close(splat[c][i], mosaic[c][i], 1e-5 * mosaic[c][i])
+                self.assertEqual(splat["frames"][i], 3)
+
+    def test_splat_reads_each_colour_where_a_moved_frame_measured_it(self):
+        # Frames one site apart: at every pixel some frame measured each colour.
+        # The full-colour merge takes it there; merging the reference's mosaic and
+        # demosaicing interpolates two of the three colours.
+        size = 192
+        scene, frames = self.coloured_frames(size, [(0, 0), (0, 1), (1, 0), (1, 1)])
+        def fused(name, *args):
+            report, rgb = self.fuse(name, *frames, "--reference", "1", "--no-deghost", "--align", "apply", *args)
+            errors = []
+            for c, channel in enumerate("RGB"):
+                e = [rgb[channel][y * size + x] - scene(y, x, c) for y in range(8, size - 8) for x in range(8, size - 8)]
+                errors.append(math.sqrt(sum(v * v for v in e) / len(e)))
+            return report, errors
+        _, mosaic = fused("mosaic", "--edges", "linear")
+        report, splat = fused("splat", "--demosaic", "splat")
+        self.assertEqual(sum(f["applied"] for f in report["alignment"]["frames"]), 3)
+        for c in range(3):
+            self.assertLess(splat[c], mosaic[c] / 2.5, (splat, mosaic))
+        self.assertLess(splat[1], 1e-4)
 
     def test_nd_gate_counts_distinct_sites(self):
         # Repeated filtered frames of one small patch add observations, not coverage.

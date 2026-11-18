@@ -25,10 +25,12 @@ float interpolateGain(const GainMap& map, int row, int col, const Layout& layout
 constexpr std::array<Point, 4> diagonals{{{-1, -1}, {-1, 1}, {1, -1}, {1, 1}}};
 constexpr std::array<Point, 4> axial{{{-1, 0}, {0, -1}, {0, 1}, {1, 0}}};
 
+// Sites are a mosaic (planes 1) or full colour (planes 3, pixel-major); a
+// donor is the same channel of a neighbouring pixel.
 bool interpolateMissing(const std::vector<Site>& sites, const Layout& layout,
                         int row, int col, const std::array<Point, 4>& offsets,
                         int step, Site& result, const std::vector<uint32_t>& sources,
-                        uint32_t& source) {
+                        uint32_t& source, size_t planes = 1, size_t channel = 0) {
     double sum = 0, total = 0, boundSum = 0;
     int bounds = 0;
     uint16_t measuredFlags = 0, boundFlags = 0;
@@ -42,7 +44,7 @@ bool interpolateMissing(const std::vector<Site>& sites, const Layout& layout,
     for (auto p : offsets) {
         const int y = row + p.row * step, x = col + p.col * step;
         if (y < 0 || x < 0 || y >= layout.height || x >= layout.width) continue;
-        const auto index = layout.index(y, x);
+        const auto index = layout.index(y, x) * planes + channel;
         const Site& donor = sites[index];
         if ((donor.flags & uncovered) || ((donor.flags & missing) && !(donor.flags & filled))) continue;
         if (donor.flags & lowerBound) {
@@ -273,8 +275,8 @@ struct EdgeEstimator {
 
 } // namespace
 
-FlatField flatField(std::vector<Site>& sites, const RawFrame& ref, const Options& o) {
-    FlatField result;
+std::vector<float> siteGains(const RawFrame& ref, const Options& o, FlatField& result) {
+    result = {};
     result.source = o.vignette;
     const auto& layout = ref.layout;
     int channels = 0;
@@ -289,9 +291,9 @@ FlatField flatField(std::vector<Site>& sites, const RawFrame& ref, const Options
         result.maps = ref.metadata.maps.size();
         if (!result.maps) result.source = "absent";
     }
-    if (!result.maps && image.empty()) return result;
+    if (!result.maps && image.empty()) return {};
 
-    std::vector<RGB> rowMax(layout.height);
+    std::vector<float> siteGain(layout.size());
     parallelRows(layout.height, o.threads, [&](int y) {
         std::vector<float> gains(layout.width, 1);
         if (embedded) {
@@ -309,16 +311,43 @@ FlatField flatField(std::vector<Site>& sites, const RawFrame& ref, const Options
             const int colour = layout.colour(y, x);
             const float gain = embedded ? gains[x] : image[i * channels + (channels == 1 ? 0 : colour)];
             if (!(gain > 0) || !std::isfinite(gain)) throw std::runtime_error("flat-field gain must be positive and finite");
-            rowMax[y][colour] = std::max(rowMax[y][colour], double(gain));
-            sites[i].signal *= gain;
-            sites[i].variance *= gain * gain;
+            siteGain[i] = gain;
+        }
+    });
+    return siteGain;
+}
+
+void applyFlatField(std::vector<Site>& sites, const Layout& layout, const std::vector<float>& gains,
+                    FlatField& result, const Options& o) {
+    if (gains.empty()) return;
+    // A full-colour site (--demosaic splat) carries the gain of its colour's
+    // sites interpolated at the pixel, the gain its merge was read relative to.
+    const size_t planes = sites.size() / layout.size();
+    std::vector<RGB> rowMax(layout.height);
+    parallelRows(layout.height, o.threads, [&](int y) {
+        for (int x = 0; x < layout.width; ++x) {
+            const auto i = layout.index(y, x);
+            if (planes == 1) {
+                const int colour = layout.colour(y, x);
+                const float gain = gains[i];
+                rowMax[y][colour] = std::max(rowMax[y][colour], double(gain));
+                sites[i].signal *= gain;
+                sites[i].variance *= gain * gain;
+                continue;
+            }
+            for (int c = 0; c < 3; ++c) {
+                const float gain = float(latticeGain(gains, layout, y, x, c));
+                rowMax[y][c] = std::max(rowMax[y][c], double(gain));
+                sites[i * 3 + c].signal *= gain;
+                sites[i * 3 + c].variance *= gain * gain;
+            }
         }
     });
     result.maxGain = {};
     for (const auto& row : rowMax)
         for (int c = 0; c < 3; ++c) result.maxGain[c] = std::max(result.maxGain[c], row[c]);
-    return result;
 }
+
 
 namespace {
 
@@ -504,15 +533,211 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
     }
 }
 
+// The same reconstruction on full-colour sites (--demosaic splat). Every
+// pixel holds all three channels, so a clipped channel is estimated from the
+// pixel's own unclipped channels times the region's rim ratios, and never
+// falls below its own bound or another channel's bound carried through them.
+void reconstructHighlightPlanes(std::vector<Site>& sites, const Layout& layout, const RGB& wb,
+                                std::vector<uint32_t>& sources) {
+    std::vector<size_t> clipped;
+    for (size_t j = 0; j < sites.size(); ++j)
+        if (sites[j].flags & lowerBound) clipped.push_back(j);
+    if (clipped.empty()) return;
+
+    const int quadWidth = (layout.width + 1) / 2, quadHeight = (layout.height + 1) / 2;
+    auto quadOf = [&](size_t j) {
+        const size_t pixel = j / 3;
+        return size_t(pixel / layout.width / 2) * quadWidth + (pixel % layout.width) / 2;
+    };
+    auto valued = [&](size_t j) {
+        const auto flags = sites[j].flags;
+        return !(flags & uncovered) && (flags & (missing | filled)) != missing;
+    };
+    auto combine = [](uint32_t current, uint32_t donor) {
+        return !donor ? current : !current || current == donor ? donor : mixedSource;
+    };
+    constexpr int32_t unclipped = -1, unlabelled = -2;
+    std::vector<int32_t> region(size_t(quadWidth) * quadHeight, unclipped);
+    for (size_t j : clipped) region[quadOf(j)] = unlabelled;
+
+    std::vector<std::array<double, 3>> sums;
+    std::vector<int> rimQuads;
+    std::vector<uint16_t> rimFlags;
+    std::vector<uint32_t> rimSources;
+    std::vector<int32_t> seen(region.size(), unclipped);
+    std::vector<size_t> queue;
+    for (size_t j : clipped) {
+        const size_t start = quadOf(j);
+        if (region[start] != unlabelled) continue;
+        const auto label = int32_t(sums.size());
+        sums.push_back({});
+        rimQuads.push_back(0);
+        rimFlags.push_back(0);
+        rimSources.push_back(0);
+        region[start] = label;
+        queue.assign(1, start);
+        for (size_t k = 0; k < queue.size(); ++k) {
+            const int qy = int(queue[k] / quadWidth), qx = int(queue[k] % quadWidth);
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int ny = qy + dy, nx = qx + dx;
+                    if (ny < 0 || nx < 0 || ny >= quadHeight || nx >= quadWidth) continue;
+                    const size_t n = size_t(ny) * quadWidth + nx;
+                    if (region[n] == unlabelled && std::abs(dy) <= 1 && std::abs(dx) <= 1) {
+                        region[n] = label;
+                        queue.push_back(n);
+                    }
+                    if (region[n] != unclipped || seen[n] == label) continue;
+                    seen[n] = label;
+                    if (2 * ny + 1 >= layout.height || 2 * nx + 1 >= layout.width) continue;
+                    std::array<double, 3> quad{};
+                    bool measured = true;
+                    uint16_t quadFlags = 0;
+                    uint32_t quadSource = 0;
+                    for (int y = 2 * ny; y < 2 * ny + 2 && measured; ++y)
+                        for (int x = 2 * nx; x < 2 * nx + 2 && measured; ++x)
+                            for (size_t c = 0; c < 3; ++c) {
+                                const size_t i = layout.index(y, x) * 3 + c;
+                                if (!valued(i) || sites[i].signal <= 0) {
+                                    measured = false;
+                                    break;
+                                }
+                                quad[c] += sites[i].signal * wb[c];
+                                quadFlags |= sites[i].flags;
+                                if (!sources.empty()) quadSource = combine(quadSource, sources[i]);
+                            }
+                    if (!measured) continue;
+                    for (size_t c = 0; c < 3; ++c) sums[size_t(label)][c] += quad[c];
+                    ++rimQuads[size_t(label)];
+                    rimFlags[size_t(label)] |= quadFlags;
+                    rimSources[size_t(label)] = combine(rimSources[size_t(label)], quadSource);
+                }
+        }
+    }
+
+    struct Update { size_t index; float signal, variance; uint16_t flags; uint32_t source; };
+    std::vector<Update> updates;
+    updates.reserve(clipped.size());
+    for (size_t j : clipped) {
+        const size_t pixel = j / 3, c = j % 3;
+        const auto label = size_t(region[quadOf(j)]);
+        const auto& sum = sums[label];
+        const bool coloured = rimQuads[label] >= 4 && sum[0] > 0 && sum[1] > 0 && sum[2] > 0;
+        double lower = sites[j].signal * wb[c], estimate = 0, estimateVariance = 0;
+        int estimates = 0;
+        uint16_t donorFlags = 0, lowerFlags = 0;
+        uint32_t source = sources.empty() ? 0 : sources[j], lowerSource = 0;
+        bool raisedByNeighbour = false;
+        for (size_t k = 0; k < 3; ++k) {
+            if (k == c) continue;
+            const size_t i = pixel * 3 + k;
+            if (!valued(i)) continue;
+            const double ratio = coloured ? sum[c] / sum[k] : 1;
+            const double value = ratio * sites[i].signal * wb[k];
+            if (sites[i].flags & lowerBound) {
+                if (value > lower) {
+                    lower = value;
+                    lowerFlags = sites[i].flags;
+                    lowerSource = sources.empty() ? 0 : sources[i];
+                    raisedByNeighbour = true;
+                }
+                continue;
+            }
+            const double variance = ratio * ratio * sites[i].variance * wb[k] * wb[k];
+            // Two channels estimate the same quantity when the colour is known.
+            // Without it, keep the neutral behaviour: the brightest one wins.
+            if (coloured || value > estimate) {
+                estimate = coloured ? estimate + value : value;
+                estimateVariance = coloured ? estimateVariance + variance : variance;
+                estimates = coloured ? estimates + 1 : 1;
+            }
+            donorFlags |= sites[i].flags;
+            if (!sources.empty()) source = combine(source, sources[i]);
+        }
+        if (estimates) {
+            estimate /= estimates;
+            estimateVariance /= double(estimates) * estimates;
+        }
+        double value = lower, variance = 0;
+        uint16_t flags = sites[j].flags | reconstructed;
+        if (estimates && estimate > lower) {
+            value = estimate;
+            variance = estimateVariance;
+            flags |= donorFlags;
+        } else {
+            source = sources.empty() ? 0 : sources[j];
+            if (raisedByNeighbour) {
+                flags |= lowerFlags;
+                source = combine(source, lowerSource);
+            }
+        }
+        if (value <= sites[j].signal * wb[c]) continue;
+        if (coloured) {
+            flags |= rimFlags[label];
+            source = combine(source, rimSources[label]);
+        }
+        updates.push_back({j, float(value / wb[c]), float(variance / (wb[c] * wb[c])), flags, source});
+    }
+    for (const auto& u : updates) {
+        sites[u.index].signal = u.signal;
+        sites[u.index].variance = u.variance;
+        sites[u.index].flags = u.flags;
+        if (!sources.empty()) sources[u.index] = u.source;
+    }
+}
+
+// --highlights neutral on full-colour sites: a pixel's clipped channels rise to
+// its brightest white-balanced channel.
+void neutralHighlightPlanes(std::vector<Site>& sites, const Layout& layout, const RGB& wb,
+                            std::vector<uint32_t>& sources, const Options& o) {
+    parallelRows(layout.height, o.threads, [&](int y) {
+        for (int x = 0; x < layout.width; ++x) {
+            const size_t pixel = layout.index(y, x);
+            double brightest = 0;
+            bool clipped = false;
+            uint16_t brightestFlags = 0;
+            uint32_t brightestSource = 0;
+            for (size_t c = 0; c < 3; ++c) {
+                const auto& s = sites[pixel * 3 + c];
+                clipped |= (s.flags & lowerBound) != 0;
+                if (s.signal * wb[c] > brightest) {
+                    brightest = s.signal * wb[c];
+                    brightestFlags = s.flags;
+                    if (!sources.empty()) brightestSource = sources[pixel * 3 + c];
+                }
+            }
+            if (!clipped) continue;
+            for (size_t c = 0; c < 3; ++c) {
+                auto& s = sites[pixel * 3 + c];
+                const double raised = brightest / wb[c];
+                if (!(s.flags & lowerBound) || raised <= s.signal) continue;
+                s.signal = float(raised);
+                s.flags |= brightestFlags;
+                if (sources.empty() || !brightestSource) continue;
+                auto& source = sources[pixel * 3 + c];
+                source = !source || source == brightestSource ? brightestSource : mixedSource;
+            }
+        }
+    });
+}
+
 } // namespace
 
 void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, const Options& o,
                  std::vector<uint32_t>& sources) {
+    // Mosaic holes take same-colour sites (diagonal then axial for green, axial
+    // then diagonal at pitch 2 for red and blue); full-colour holes take the
+    // same channel of the axial, then diagonal, neighbours.
+    const size_t planes = sites.size() / layout.size();
     std::vector<size_t> holes;
     for (size_t i = 0; i < sites.size(); ++i)
         if ((sites[i].flags & (missing | uncovered)) == missing) holes.push_back(i);
     auto repair = [&](size_t i, Site& value, uint32_t& source) {
-        const int y = int(i / layout.width), x = int(i % layout.width);
+        const size_t pixel = i / planes, channel = i % planes;
+        const int y = int(pixel / layout.width), x = int(pixel % layout.width);
+        if (planes == 3)
+            return interpolateMissing(sites, layout, y, x, axial, 1, value, sources, source, planes, channel) ||
+                   interpolateMissing(sites, layout, y, x, diagonals, 1, value, sources, source, planes, channel);
         const bool green = layout.colour(y, x) == 1;
         return interpolateMissing(sites, layout, y, x, green ? diagonals : axial, green ? 1 : 2, value, sources, source) ||
                interpolateMissing(sites, layout, y, x, green ? axial : diagonals, 2, value, sources, source);
@@ -534,14 +759,14 @@ void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, 
         if (!sources.empty()) sources[holes[k]] = repairSources[k];
     }
     for (size_t k = 0; k < frontier.size(); ++k) {
-        const size_t index = frontier[k];
-        const int y = int(index / layout.width), x = int(index % layout.width);
-        const bool green = layout.colour(y, x) == 1;
+        const size_t index = frontier[k], pixel = index / planes, channel = index % planes;
+        const int y = int(pixel / layout.width), x = int(pixel % layout.width);
+        const bool green = planes == 1 && layout.colour(y, x) == 1;
         auto propagate = [&](const std::array<Point, 4>& offsets, int step) {
             for (auto p : offsets) {
                 const int row = y + p.row * step, col = x + p.col * step;
                 if (row < 0 || col < 0 || row >= layout.height || col >= layout.width) continue;
-                const size_t i = layout.index(row, col);
+                const size_t i = layout.index(row, col) * planes + channel;
                 auto& site = sites[i];
                 uint32_t source = 0;
                 if ((site.flags & (missing | filled | uncovered)) == missing && repair(i, site, source)) {
@@ -550,10 +775,20 @@ void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, 
                 }
             }
         };
-        propagate(green ? diagonals : axial, green ? 1 : 2);
-        propagate(green ? axial : diagonals, 2);
+        if (planes == 3) {
+            propagate(axial, 1);
+            propagate(diagonals, 1);
+        } else {
+            propagate(green ? diagonals : axial, green ? 1 : 2);
+            propagate(green ? axial : diagonals, 2);
+        }
     }
     if (o.highlights == "bound") return;
+    if (planes == 3) {
+        if (o.highlights == "reconstruct") reconstructHighlightPlanes(sites, layout, wb, sources);
+        else neutralHighlightPlanes(sites, layout, wb, sources, o);
+        return;
+    }
     if (o.highlights == "reconstruct") {
         reconstructHighlights(sites, layout, wb, sources);
         return;
@@ -594,6 +829,84 @@ void repairSites(std::vector<Site>& sites, const Layout& layout, const RGB& wb, 
     });
 }
 
+namespace {
+
+// Full-colour sites need no demosaic: each output channel is the colour matrix
+// applied to the pixel's own three channels.
+Output renderPlanes(const std::vector<Site>& sites, const Layout& layout, const Matrix& transform,
+                    double scale, const Options& o, const std::vector<uint32_t>& sources) {
+    Output output;
+    output.rgb.resize(layout.size() * 3);
+    if (o.aux) {
+        output.variance.resize(layout.size() * 3);
+        output.frames.resize(layout.size());
+        output.flags.resize(layout.size());
+        if (!sources.empty()) output.sources.resize(layout.size());
+    }
+    std::atomic<size_t> floors{0};
+    parallelRows(layout.height, o.threads, [&](int y) {
+        size_t flooredRow = 0;
+        for (int x = 0; x < layout.width; ++x) {
+            const auto i = layout.index(y, x);
+            const Site* pixel = &sites[i * 3];
+            if (pixel[0].flags & uncovered) {
+                const float floor = float(o.outputFloor);
+                std::fill_n(output.rgb.data() + i * 3, 3, floor);
+                flooredRow += floor > 0;
+                if (o.aux) output.flags[i] = pixel[0].flags | (floor > 0 ? floored : 0);
+                continue;
+            }
+            RGB camera{};
+            std::array<bool, 3> valued{};
+            for (size_t c = 0; c < 3; ++c) {
+                const auto flags = pixel[c].flags;
+                valued[c] = !(flags & uncovered) && (flags & (missing | filled)) != missing;
+                camera[c] = valued[c] ? pixel[c].signal : 0;
+            }
+            bool anyFloor = false;
+            uint16_t frames = 0;
+            uint32_t flags = 0, source = 0;
+            for (size_t c = 0; c < 3; ++c) {
+                double value = 0;
+                for (size_t k = 0; k < 3; ++k) value += transform[c][k] * camera[k];
+                value *= scale;
+                if (!std::isfinite(float(value))) throw std::runtime_error("output radiance overflows float32");
+                if (o.outputFloor > 0 && value < o.outputFloor) {
+                    value = o.outputFloor;
+                    anyFloor = true;
+                }
+                output.rgb[i * 3 + c] = float(value);
+                if (!o.aux) continue;
+                double variance = 0;
+                for (size_t k = 0; k < 3; ++k) {
+                    const double weight = transform[c][k] * scale;
+                    if (weight == 0) continue;
+                    const auto& site = pixel[k];
+                    flags |= site.flags | (valued[k] ? 0u : missing);
+                    if (!valued[k]) continue;
+                    variance += weight * weight * site.variance;
+                    frames = std::max(frames, site.frames);
+                    const uint32_t contributor = sources.empty() ? 0 : sources[i * 3 + k];
+                    if (contributor) source = !source || source == contributor ? contributor : mixedSource;
+                }
+                if (!std::isfinite(float(variance))) throw std::runtime_error("output variance overflows float32");
+                output.variance[i * 3 + c] = float(variance);
+            }
+            flooredRow += anyFloor;
+            if (o.aux) {
+                output.frames[i] = frames;
+                output.flags[i] = flags | (anyFloor ? floored : 0);
+                if (!sources.empty()) output.sources[i] = source;
+            }
+        }
+        floors.fetch_add(flooredRow, std::memory_order_relaxed);
+    });
+    output.flooredPixels = floors;
+    return output;
+}
+
+} // namespace
+
 Output render(const std::vector<Site>& sites, const Layout& layout, const Colour& colour,
               double scale, const Options& o, const std::vector<uint32_t>& sources) {
     Output output;
@@ -610,6 +923,7 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
         for (auto& row : transform)
             for (int c = 0; c < 3; ++c) row[c] *= colour.wb[c];
     }
+    if (sites.size() == layout.size() * 3) return renderPlanes(sites, layout, transform, scale, o, sources);
 
     const bool useMhc = o.demosaic == "mhc", useEdges = o.edges == "ratio";
     const EdgeEstimator edges{sites, layout};
