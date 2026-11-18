@@ -1,8 +1,9 @@
 # Alignment and splatting merge (design, in progress)
 
-Status: stage 1 (motion estimation, reported only) is implemented on the
-`splat-merge` branch. Stages 2–4 are planned. This note records the design so
-the stages can land one at a time.
+Status: stages 1 (motion estimation) and 2 (motion-compensated merge on the
+reference mosaic, `--align apply`) are implemented on the `splat-merge` branch.
+Stages 3–5 are planned. This note records the design so the stages can land one
+at a time.
 
 ## Goal
 
@@ -25,20 +26,20 @@ sample is never interpolated, only weighted by its distance to the output pixel.
 ## Stages
 
 1. **Motion estimation (done).** A motion field per frame, relative to the
-   reference frame of the first group, reported in the JSON and status line.
-   Nothing is warped yet.
-2. **Sample cloud and splat accumulation for one group.** Each usable raw
-   sample becomes (position in reference coordinates, colour, rate, variance,
-   state). Output pixels accumulate kernel × inverse-variance weights per
-   colour. Clipped samples contribute lower bounds; bloom and dark-model states
-   keep their current meaning. Robustness (Wronski's local-statistics test)
-   replaces quad motion rejection. Behind `--merge splat`; the mosaic path stays
-   the default.
-3. **Groups, calibration and highlights on RGB.** ND calibration, scene drift,
-   offset matching and highlight reconstruction move from mosaic sites to RGB
-   pixels with per-channel provenance. Exposure-ratio and noise measurement
-   sample frame pairs through the motion fields.
-4. **Anisotropic kernels.** Structure-tensor kernels per output pixel (edge
+   reference frame of the first group, in the JSON and status line
+   (`--align report`).
+2. **Motion-compensated merge on the reference mosaic (done).** `--align apply`
+   reads every aligned frame through its field: the accumulation evaluated at
+   the reference's own colour sites. Groups, calibration, highlights and the
+   demosaic run unchanged on that mosaic.
+3. **Full-colour accumulation.** Evaluate the same accumulation for all three
+   channels at every pixel, so each frame's samples of every colour land where
+   they fell and the separate demosaic goes. Repair, highlight reconstruction
+   and offset matching then work on per-channel sites with provenance.
+4. **Per-pixel robustness.** Wronski's local-statistics test replaces quad
+   motion rejection and decides where scene motion (clouds, foliage) is
+   followed or rejected.
+5. **Anisotropic kernels.** Structure-tensor kernels per output pixel (edge
    direction and strength from the merged luminance), which also replace the
    steep-edge ratio interpolation.
 
@@ -97,11 +98,41 @@ most valid quads. Each later group is tied to the earlier ones by its single
 best-overlapping pair (up to four candidates are tried), then grows inside
 itself. Fields compose by addition, `d_k ≈ d_a + d_ka`.
 
-**Output.** `--align off` (the default) skips the estimate, so output stays as before; `report` estimates and reports
-it. The JSON `alignment` block lists per frame its parent, global shift and
-uncertainty, roll, log-gain (`gain_ev`), residual scale, model RMS and the tile
-grid (`dy`, `dx`, `measured`, `scene`). `applied` is false: nothing is warped
-yet, and a warning names how many frames are shifted by more than 0.5 sites.
+**Output.** `--align off` (the default) skips the estimate, so output stays as
+before; `report` estimates and reports it; `apply` also merges through it
+(stage 2). The JSON `alignment` block lists per frame its parent, global shift
+and uncertainty, roll, log-gain (`gain_ev`), residual scale, model RMS, the tile
+grid (`dy`, `dx`, `measured`, `scene`) and whether the merge used it
+(`applied`). Under `report`, a warning names how many frames are shifted by more
+than 0.5 sites.
+
+## Stage 2: motion-compensated merge
+
+`sample()` is the one place frames are read for the merge, deghosting, ND
+calibration and exposure ratios. A frame with a motion field is read at the
+reference site's position in it, bilinear over the four nearest sites of the
+same colour: red and blue sites form a square lattice of pitch 2, green sites a
+quincunx, which is a square lattice of pitch 2 in u = row + col, v = row − col.
+No colour is mixed into another, and a position on a site reads that site
+alone, so zero motion reads the frame exactly as before. The sample's noise
+terms are scaled by Σw², which the merge weights use.
+
+States combine conservatively. Any missing site (outside the frame or its
+validity, a defect) makes the sample missing, so masks erode rather than blend;
+any clipped site makes it a lower bound, the weighted sum of the clipped sites'
+thresholds and the others' readings; a bloom site makes it an adjacent-clip
+fallback.
+
+After the estimate, exposure ratios are measured again through the fields
+(starting from EXIF, so the first unaligned measurement does not compound). The
+noise fit keeps its unaligned pairs: interpolation would shrink the pair
+differences it measures. Frames whose motion is unconstrained or unknown are
+read directly and named in the estimate's warnings.
+
+This is interpolation of each colour plane, which stage 3 replaces: a moved
+frame's samples are blurred by up to half a lattice pitch where they dominate
+the merge. With four 1–3-site shifts of a smooth texture, the merged green
+sites' RMS error against the scene drops from 2.0% to 0.2% of the signal.
 
 ## Katoomba side A (Canon R6, 8 mm fisheye, 21 frames)
 
@@ -116,14 +147,24 @@ yet, and a warning names how many frames are shifted by more than 0.5 sites.
   tiles. Their log-gain against the open bracket, −10.17 to −10.24 EV, agrees
   with the measured ND strength.
 - Cost: 5.2 s of an 11 s run, mostly the tile fits and quad images.
+- `--align apply` reads 13 frames through their fields (the ND frames
+  directly). Where a dark silhouette crosses the open bracket's contribution
+  boundary, its edge jumps 2.2 sites without alignment and 0.6 with it (within
+  the silhouette's own raggedness). Open and ND attenuation change by under
+  0.005 EV: both are medians over smooth sky. The run takes 17.8 s against
+  8.2 s; the merge's four-site reads double its time.
 
 ## Open questions
 
 - **Scene motion.** Clouds and foliage are labelled per tile but not followed.
   Following them aligns their content but also follows bad fits (the dim rim
-  of the image circle, validity-mask edges); stage 2's per-pixel robustness test
+  of the image circle, validity-mask edges); stage 4's per-pixel robustness test
   is the place to decide, with the photometric residual as evidence.
 - **Short frames.** Their camera motion should probably be shrunk toward the
   bracket's long frames unless the evidence is strong.
-- **Exposure and noise measurement** still pair frames site by site; stage 3
-  samples them through the fields.
+- **Unconstrained groups.** The ND group cannot be measured and is read
+  unshifted, although it was shot between the open and blocked brackets. A
+  manifest `shift` (TODO.md) would let the caller supply it.
+- **Noise measurement** still pairs frames site by site, so handheld brackets
+  inflate it; it needs aligned pairs with the Σw² factor.
+- **Scene drift** sites in ND calibration read frames directly.

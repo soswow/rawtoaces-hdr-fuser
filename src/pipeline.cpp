@@ -343,23 +343,49 @@ void reportBrackets(const Status& status, const FrameGroups& frames, const Prepa
     status(line.str());
 }
 
-std::string frameName(const FrameGroups& frames, const FrameAlignment& a, const Options& o) {
-    return o.groups[a.group].name + " #" + std::to_string((*frames[a.group])[a.frame].inputIndex + 1);
+std::string frameName(const FrameAlignment& a, const Options& o) {
+    return o.groups[a.group].name + " #" + std::to_string(a.input + 1);
 }
 
-Json alignmentReport(const Alignment& alignment, const FrameGroups& frames, const Options& o) {
+// --align apply: frames whose motion was estimated read the mosaic through it.
+// Exposure ratios are measured again through the fields; the noise fit keeps
+// its unaligned pairs, since interpolation would shrink their differences.
+size_t applyAlignment(const Alignment& alignment, const FrameGroups& frames, const Options& o,
+                      Preparation& preparation, Warnings& warnings) {
+    size_t applied = 0;
+    for (const auto& a : alignment.frames) {
+        if (!a.aligned || a.reference || a.field.dy.empty()) continue;
+        (*frames[a.group])[a.frame].motion = std::make_shared<const MotionField>(a.field);
+        ++applied;
+    }
+    if (applied && o.exposures == "measured") {
+        for (auto* group : frames)
+            for (auto& frame : *group) frame.effective = frame.exifEffective;
+        Warnings again;
+        preparation.exposureSteps = measureExposures(frames, o, again);
+        for (auto& w : again)
+            if (std::find(warnings.begin(), warnings.end(), w) == warnings.end()) warnings.push_back(w);
+        for (auto* group : frames)
+            std::stable_sort(group->begin(), group->end(),
+                             [](const auto& a, const auto& b) { return a.effective < b.effective; });
+    }
+    return applied;
+}
+
+Json alignmentReport(const Alignment& alignment, const Options& o) {
     if (alignment.frames.empty()) return nullptr;
+    const bool apply = o.align == "apply";
     Json list = Json::array();
     for (const auto& a : alignment.frames) {
-        Json entry{{"group", o.groups[a.group].name}, {"input", (*frames[a.group])[a.frame].inputIndex + 1},
-                   {"reference", a.reference}, {"aligned", a.aligned}, {"coverage", a.coverage}};
+        Json entry{{"group", o.groups[a.group].name}, {"input", a.input + 1},
+                   {"reference", a.reference}, {"aligned", a.aligned}, {"coverage", a.coverage},
+                   {"applied", apply && a.aligned && !a.reference}};
         // An unconstrained estimate is reported for diagnosis but not used.
         if (a.unconstrained && !a.inherited) entry["unconstrained"] = true;
         if ((a.aligned || a.unconstrained) && !a.reference) {
             const auto& parent = alignment.frames[a.alignedTo];
             entry[a.inherited ? "inherited_from" : "aligned_to"] = {
-                {"group", o.groups[parent.group].name},
-                {"input", (*frames[parent.group])[parent.frame].inputIndex + 1}};
+                {"group", o.groups[parent.group].name}, {"input", parent.input + 1}};
             entry["shift"] = {{"rows", a.shift[0]}, {"cols", a.shift[1]}};
             entry["shift_uncertainty"] = a.uncertainty;
             entry["median_shift"] = a.medianShift;
@@ -378,11 +404,11 @@ Json alignmentReport(const Alignment& alignment, const FrameGroups& frames, cons
         }
         list.push_back(std::move(entry));
     }
-    return {{"method", "tile-translation"}, {"applied", false}, {"frames", std::move(list)}};
+    return {{"method", "tile-translation"}, {"applied", apply}, {"frames", std::move(list)}};
 }
 
 void reportAlignment(const Status& status, const Alignment& alignment, const FrameGroups& frames,
-                     const Options& o, Warnings& warnings) {
+                     const Options& o, size_t applied, Warnings& warnings) {
     const auto root = std::find_if(alignment.frames.begin(), alignment.frames.end(),
                                    [](const auto& a) { return a.reference; });
     if (root == alignment.frames.end()) return;
@@ -408,18 +434,22 @@ void reportAlignment(const Status& status, const Alignment& alignment, const Fra
             continue;
         }
         std::ostringstream line;
-        line << o.groups[g].name << ": motion against " << frameName(frames, *root, o) << " measured on "
+        line << o.groups[g].name << ": motion against " << frameName(*root, o) << " measured on "
              << measured << (measured == 1 ? " frame" : " frames");
         if (inherited) line << " (" << inherited << " more take a neighbour's)";
         if (unaligned) line << ", " << unaligned << " unconstrained";
         line << "; largest shift " << fixed(std::hypot(largest->shift[0], largest->shift[1]), 2)
-             << " px (" << frameName(frames, *largest, o) << ": rows " << fixed(largest->shift[0], 2)
+             << " px (" << frameName(*largest, o) << ": rows " << fixed(largest->shift[0], 2)
              << ", cols " << fixed(largest->shift[1], 2) << ")";
         status(line.str());
     }
-    if (moved)
+    (void)frames;
+    if (o.align == "apply")
+        status("alignment: the merge reads " + std::to_string(applied) +
+               (applied == 1 ? " frame" : " frames") + " through their motion fields");
+    else if (moved)
         warnings.push_back(std::to_string(moved) + (moved == 1 ? " frame is" : " frames are") +
-                           " shifted by more than 0.5 px; the merge does not compensate motion yet");
+                           " shifted by more than 0.5 px; --align apply compensates it in the merge");
 }
 
 void reportComposition(const Status& status, const std::vector<GroupResult>& results, double scale,
@@ -503,14 +533,16 @@ void fuse(const Options& o, Warnings& warnings) {
                first.layout.pattern() + ")");
     }
 
-    const auto preparation = prepareFrames(frames, *sidecars, o, warnings);
+    auto preparation = prepareFrames(frames, *sidecars, o, warnings);
     time.mark("prepare");
     reportBrackets(status, frames, preparation, o);
     Alignment alignment;
     if (o.align != "off" && (frames.size() > 1 || plain.size() > 1)) {
         alignment = estimateAlignment(frames, findReference(plain, o), o, warnings);
+        const size_t applied = o.align == "apply" ?
+            applyAlignment(alignment, frames, o, preparation, warnings) : 0;
         time.mark("align");
-        reportAlignment(status, alignment, frames, o, warnings);
+        reportAlignment(status, alignment, frames, o, applied, warnings);
     }
     status.detail("merging Bayer samples");
     auto composition = mergeGroups(frames, *sidecars, o, warnings);
@@ -599,7 +631,7 @@ void fuse(const Options& o, Warnings& warnings) {
         {"output_floor", o.outputFloor > 0 ? Json(o.outputFloor) : Json(nullptr)},
         {"dark_model", o.darkModel.empty() ? Json(nullptr) : Json(o.darkModel.string())},
         {"vignette", {{"source", field.source}, {"gain_maps", field.maps}, {"max_gain", rgbReport(field.maxGain)}}},
-        {"groups", std::move(groupsReport)}, {"alignment", alignmentReport(alignment, frames, o)},
+        {"groups", std::move(groupsReport)}, {"alignment", alignmentReport(alignment, o)},
         {"merge", stats},
         {"demosaic", o.demosaic},
         {"edges", {{"method", o.edges}, {"pixels", output.edgePixels},

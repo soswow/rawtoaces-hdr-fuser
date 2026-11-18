@@ -601,6 +601,7 @@ Alignment estimateAlignment(const FrameGroups& groups, size_t reference, const O
         auto& entry = result.frames[k];
         entry.group = nodes[k].group;
         entry.frame = nodes[k].frame;
+        entry.input = nodes[k].raw->inputIndex;
         entry.coverage = std::count(covered[k].begin(), covered[k].end(), 1);
     }
     auto& rootEntry = result.frames[root];

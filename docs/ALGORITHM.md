@@ -57,7 +57,7 @@ A DNG `NoiseProfile` (or `--noise S,O`) is used as given. Otherwise the model is
 
 The noise model sets the merge weights, the variance output and which samples are reliable enough for attenuation calibration.
 
-**Motion estimate (reported only).** With `--align report` (off by default) and more than one frame, every frame's motion against the first group's reference frame is estimated from log-rate quad images: per tile of 128 × 128 sites a translation by robust Gauss–Newton, and per frame a rigid camera model (translation and roll) fitted to the tiles. Frames are chained through the pairs that share the most valid quads, inside a bracket where possible. The report's `alignment` block holds each frame's shift, roll, log-gain and tile field; the merge does not use it yet, and frames shifted by more than 0.5 sites are named in a warning. [ALIGNMENT.md](ALIGNMENT.md) has the method, its accuracy and the planned splatting merge.
+**Motion (off by default).** With `--align report` or `apply` and more than one frame, every frame's motion against the first group's reference frame is estimated from log-rate quad images: per tile of 128 × 128 sites a translation by robust Gauss–Newton, and per frame a rigid camera model (translation and roll) fitted to the tiles. Frames are chained through the pairs that share the most valid quads, inside a bracket where possible. The report's `alignment` block holds each frame's shift, roll, log-gain and tile field. `report` changes nothing else and names frames shifted by more than 0.5 sites in a warning. `apply` reads each aligned frame at the reference site's position in it, bilinear over the four nearest sites of the same colour (σ² scaled by Σw²); a missing site makes the sample missing and a clipped one makes it a lower bound. Every later step that reads frames (merge, deghosting, attenuation calibration, exposure ratios, measured again after the estimate) then sees aligned frames; the noise fit keeps unaligned pairs. [ALIGNMENT.md](ALIGNMENT.md) has the method, its accuracy and the planned full-colour splatting merge.
 
 ### 5. Merge each group
 
@@ -177,7 +177,7 @@ Warnings go to stderr and the report: exposure steps that could not be measured 
 | `dark_model` | dark-model CSV, fitting, per-site dark signal and extra variance |
 | `bracket` | measured exposure ratios and noise model |
 | `merge` | exposure merge and motion handling |
-| `align` | motion estimation between frames (reported only) |
+| `align` | motion estimation between frames; `raw_frame` reads frames through it |
 | `nd` | attenuation calibration and scene drift |
 | `groups` | manifest, group masks and composition |
 | `finish` | flat field, highlights, repair and demosaic |
@@ -194,7 +194,7 @@ Warnings go to stderr and the report: exposure steps that could not be measured 
 - `blocks_flagged` are diagnostic and do not change the composition.
 - Offset matching assumes earlier groups see the same scene; it only corrects smooth additive differences and reaches into a replaced area from its border.
 - Automatic attenuation needs enough overlap between the reference and attenuated exposures. Without it, supply a measured `ev`.
-- Motion between frames is measured and reported but not compensated, and there is no deghosting between independent sweeps. The caller must supply a fixed camera and a static scene; the `alignment` report and its warning show how far a capture departs from that.
+- Without `--align apply`, motion between frames is not compensated. With it, moved frames are interpolated per colour plane, which softens detail where they dominate; groups whose motion cannot be measured (sparse ND frames) are read unshifted, and there is no deghosting between independent sweeps.
 - The CLI is the supported interface. `rawfuse_pipeline` is a build target, but there is no installed, versioned C++ package or stable ABI. Its low-level stages assume validated input, and `run()` sets process-wide OpenEXR/OIIO thread limits (restored on return).
 - Peak memory is dominated by decoding all frames of a group at once, roughly 50 MB per full-resolution frame.
 - Development and testing so far use macOS with synthetic Bayer DNGs. Linux and Windows CI and native CR3 coverage are not yet in place.

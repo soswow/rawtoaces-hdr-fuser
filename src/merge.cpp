@@ -9,16 +9,16 @@ namespace {
 struct Measurement {
     const RawFrame* frame;
     double exposure;
-    float fraction, extra;
+    float fraction, extra, spread = 1;
 };
 
-double variance(const Noise& noise, double fraction, double extra) {
-    return std::max(1e-16, noise.shot * std::max(fraction, 0.0) + noise.read + extra);
+double variance(const Noise& noise, double fraction, double extra, double spread = 1) {
+    return std::max(1e-16, spread * (noise.shot * std::max(fraction, 0.0) + noise.read) + extra);
 }
 
 Site one(const Measurement& m, int colour) {
     const double rate = m.fraction / m.exposure;
-    const double var = variance(m.frame->noise[colour], m.fraction, m.extra) / (m.exposure * m.exposure);
+    const double var = variance(m.frame->noise[colour], m.fraction, m.extra, m.spread) / (m.exposure * m.exposure);
     return {float(rate), float(var), 0, 1};
 }
 
@@ -76,11 +76,11 @@ SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const
         const double exposure = frame.effective;
         if (s.state == SampleState::clipped) bound = std::max(bound, std::max(0.0, double(s.fraction)) / exposure);
         if (s.state == SampleState::aboveHigh && (!aboveHigh || exposure < aboveHigh->exposure))
-            aboveHigh = {&frame, exposure, s.fraction, s.extra};
+            aboveHigh = {&frame, exposure, s.fraction, s.extra, s.spread};
         if (s.state == SampleState::adjacentClip && (!adjacent || exposure < adjacent->exposure))
-            adjacent = {&frame, exposure, s.fraction, s.extra};
+            adjacent = {&frame, exposure, s.fraction, s.extra, s.spread};
         if (s.state != SampleState::usable) continue;
-        usable.push_back({&frame, exposure, s.fraction, s.extra});
+        usable.push_back({&frame, exposure, s.fraction, s.extra, s.spread});
         const double weight = std::max(0.0, std::min(s.fraction - o.low, o.high - s.fraction));
         seed += weight * s.fraction / exposure;
         seedWeight += weight;
@@ -104,7 +104,7 @@ SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const
     bool shadow = true;
     for (const auto& m : usable) {
         const auto noise = m.frame->noise[colour];
-        const double scaledWeight = m.exposure / variance(noise, seed * m.exposure, m.extra);
+        const double scaledWeight = m.exposure / variance(noise, seed * m.exposure, m.extra, m.spread);
         sum += scaledWeight * m.fraction;
         total += scaledWeight * m.exposure;
         shadow &= m.fraction < o.low;
@@ -159,7 +159,7 @@ MergeResult mergePlain(const std::vector<RawFrame>& frames, const Options& o, co
             if (isMoving) {
                 const auto s = sample(ref, row, col, index, o);
                 if (s.state == SampleState::usable) {
-                    result.sites[index] = one({&ref, ref.effective, s.fraction, s.extra}, layout.colour(row, col));
+                    result.sites[index] = one({&ref, ref.effective, s.fraction, s.extra, s.spread}, layout.colour(row, col));
                     result.sites[index].flags |= moving;
                     shadows += s.fraction < o.low;
                     if (trackShadow) result.shadowSites[index] = s.fraction < o.low;

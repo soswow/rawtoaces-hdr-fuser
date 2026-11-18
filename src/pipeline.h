@@ -92,6 +92,7 @@ struct Layout {
 
 struct Noise { double shot, read; };
 enum FrameMask : uint8_t { saturated = 1, bloom = 2, excluded = 4, modeled = 8, badRect = 16, outsideValidity = 32 };
+struct MotionField;
 struct RawFrame {
     fs::path path;
     Layout layout;
@@ -120,6 +121,9 @@ struct RawFrame {
     std::vector<std::pair<size_t, float>> dark;
     size_t hotKept = 0, hotMissing = 0, hotRejected = 0, undatedDefects = 0;
     double darkUncertainty = 0;
+    // With --align apply: where this frame sees each reference site. sample()
+    // then reads the frame through it; null reads the frame's own sites.
+    std::shared_ptr<const MotionField> motion;
 
     uint16_t raw(int row, int col) const { return mosaic[size_t(row) * stride + col]; }
     float black(int row, int col) const {
@@ -198,9 +202,14 @@ struct Sample {
     SampleState state;
     // For a clipped sample: the clipping threshold, a lower bound on the signal.
     float fraction = 0, extra = 0;
+    // Σw² of the sites a motion-compensated sample interpolates: the factor on
+    // their shot and read noise (1 for a site read directly).
+    float spread = 1;
 };
 
 // Each frame uses its own black and white levels; they may differ within a bracket.
+// A frame with a motion field is read at the reference site's position in it,
+// interpolated over the sites of the same colour (docs/ALIGNMENT.md, stage 2).
 Sample sample(const RawFrame&, int row, int col, size_t index, const Options&);
 struct MergeResult {
     std::vector<Site> sites;
@@ -231,7 +240,8 @@ struct MotionField {
     std::array<double, 2> at(double row, double col) const;
 };
 struct FrameAlignment {
-    size_t group = 0, frame = 0;      // Position in the exposure-sorted groups
+    size_t group = 0, frame = 0;      // Position in the exposure-sorted groups at estimation
+    size_t input = 0;                 // Zero-based input index within the group
     size_t alignedTo = 0;             // Index into Alignment::frames
     bool reference = false, aligned = false;
     bool inherited = false;           // Too little overlap: motion of alignedTo, same bracket

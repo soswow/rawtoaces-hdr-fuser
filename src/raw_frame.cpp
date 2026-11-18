@@ -577,7 +577,9 @@ std::optional<int> parseUtcOffset(const std::string& raw) {
     return text[0] == '-' ? -seconds : seconds;
 }
 
-Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
+namespace {
+
+Sample siteSample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
     const auto mask = frame.rejected[index];
     if (mask & (excluded | outsideValidity)) return {SampleState::missing};
     const float black = frame.black(row, col);
@@ -597,5 +599,66 @@ Sample sample(const RawFrame& frame, int row, int col, size_t index, const Optio
     const float fraction = float((frame.raw(row, col) - black) / full - dark);
     if (mask & bloom) return {SampleState::adjacentClip, fraction, float(extra)};
     return {fraction <= o.high ? SampleState::usable : SampleState::aboveHigh, fraction, float(extra)};
+}
+
+} // namespace
+
+// A motion-compensated sample is bilinear over the four sites of the reference
+// site's colour around its position in the frame; no other colour is mixed in.
+// Red and blue sites form a square lattice of pitch 2. Green sites form a
+// quincunx, a square lattice of pitch 2 in u = row + col, v = row − col. A
+// position on a site reads that site alone, so zero motion reads the frame as
+// without alignment.
+//
+// The state is the most conservative of the sites used: any missing site
+// (outside the frame or its validity, a defect) makes the sample missing, so
+// masks erode rather than blend; any clipped site makes it a lower bound, the
+// weighted sum of the clipped sites' thresholds and the others' readings.
+Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
+    if (!frame.motion) return siteSample(frame, row, col, index, o);
+    const auto& layout = frame.layout;
+    const auto d = frame.motion->at(row, col);
+    const double y = row + d[0], x = col + d[1];
+    const int colour = layout.colour(row, col);
+    struct Tap { int row, col; double weight; };
+    std::array<Tap, 4> taps;
+    if (layout.colour(row ^ 1, col ^ 1) == colour) {
+        const int ur = row + col, vr = row - col;
+        const double u = y + x, v = y - x;
+        const int u0 = ur + 2 * int(std::floor((u - ur) / 2)), v0 = vr + 2 * int(std::floor((v - vr) / 2));
+        const double fu = (u - u0) / 2, fv = (v - v0) / 2;
+        for (int k = 0; k < 4; ++k) {
+            const int uu = u0 + 2 * (k / 2), vv = v0 + 2 * (k % 2);
+            taps[size_t(k)] = {(uu + vv) / 2, (uu - vv) / 2, (k / 2 ? fu : 1 - fu) * (k % 2 ? fv : 1 - fv)};
+        }
+    } else {
+        const int r0 = row + 2 * int(std::floor((y - row) / 2)), c0 = col + 2 * int(std::floor((x - col) / 2));
+        const double fy = (y - r0) / 2, fx = (x - c0) / 2;
+        for (int k = 0; k < 4; ++k)
+            taps[size_t(k)] = {r0 + 2 * (k / 2), c0 + 2 * (k % 2), (k / 2 ? fy : 1 - fy) * (k % 2 ? fx : 1 - fx)};
+    }
+    double total = 0;
+    for (const auto& tap : taps)
+        if (tap.weight > 1e-6) total += tap.weight;
+    double fraction = 0, extra = 0, spread = 0;
+    bool clipped = false, above = false, adjacent = false;
+    for (const auto& tap : taps) {
+        if (tap.weight <= 1e-6) continue;
+        if (tap.row < 0 || tap.col < 0 || tap.row >= layout.height || tap.col >= layout.width)
+            return {SampleState::missing};
+        const auto s = siteSample(frame, tap.row, tap.col, layout.index(tap.row, tap.col), o);
+        if (s.state == SampleState::missing) return {SampleState::missing};
+        clipped |= s.state == SampleState::clipped;
+        above |= s.state == SampleState::aboveHigh;
+        adjacent |= s.state == SampleState::adjacentClip;
+        const double w = tap.weight / total;
+        fraction += w * s.fraction;
+        extra += w * w * s.extra;
+        spread += w * w;
+    }
+    if (clipped) return {SampleState::clipped, float(fraction)};
+    const auto state = adjacent ? SampleState::adjacentClip
+                     : above || fraction > o.high ? SampleState::aboveHigh : SampleState::usable;
+    return {state, float(fraction), float(extra), float(spread)};
 }
 }

@@ -19,6 +19,22 @@ from synthetic import SIZE, close, dng, opcode, read_exr
 EXE = str(Path(sys.argv.pop(1)).resolve())
 
 
+def textured_scene(seed=7):
+    """Smooth random texture around 0.1, down to a 12-site wavelength, as lens blur
+    leaves it. Finer detail, near the quad grid's limit, biases a measured shift by
+    a few hundredths of a site."""
+    rng = random.Random(seed)
+    waves = [(rng.uniform(0, 2 * math.pi), rng.uniform(12, 48), rng.uniform(0, math.pi), rng.uniform(0.3, 1))
+             for _ in range(12)]
+    norm = sum(w[3] for w in waves)
+
+    def scene(y, x):
+        texture = sum(a * math.sin(2 * math.pi * (x * math.cos(t) + y * math.sin(t)) / l + p)
+                      for p, l, t, a in waves) / norm
+        return 0.1 * (1 + 0.8 * texture)
+    return scene
+
+
 class ReviewTests(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="rawfuse-review-")
@@ -494,16 +510,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_alignment_measures_sub_pixel_shifts_within_and_between_groups(self):
         size = 256
-        rng = random.Random(7)
-        # Texture down to a 12-site wavelength, as lens blur leaves it. Finer detail,
-        # near the quad grid's limit, biases a shift by a few hundredths of a site.
-        waves = [(rng.uniform(0, 2 * math.pi), rng.uniform(12, 48), rng.uniform(0, math.pi), rng.uniform(0.3, 1))
-                 for _ in range(12)]
-        norm = sum(w[3] for w in waves)
-        def scene(y, x):  # Rate at the (1, 10) exposure
-            texture = sum(a * math.sin(2 * math.pi * (x * math.cos(t) + y * math.sin(t)) / l + p)
-                          for p, l, t, a in waves) / norm
-            return 0.1 * (1 + 0.8 * texture)
+        scene = textured_scene()
         def frame(name, exposure, scale, shift):
             path = self.folder / name
             dy, dx = shift
@@ -529,9 +536,34 @@ class ReviewTests(unittest.TestCase):
             self.assertLess(f["max_shift"] - math.hypot(dy, dx), 0.05, key)
             close(f["gain_ev"], 0, 0.02)
         self.assertFalse(report["alignment"]["applied"])
-        self.assertIn("the merge does not compensate motion yet", " ".join(report["warnings"]))
+        self.assertIn("--align apply compensates it", " ".join(report["warnings"]))
         report, _ = self.fuse("unaligned", "--groups", manifest)
         self.assertIsNone(report["alignment"])
+
+    def test_apply_merges_moved_frames_at_their_motion(self):
+        size = 256
+        scene = textured_scene()
+        shifts = [(0, 0), (0.6, -1.1), (-1.4, 0.8), (2.3, 1.7)]
+        frames = []
+        for k, (dy, dx) in enumerate(shifts):
+            path = self.folder / f"m{k}.dng"
+            dng(path, (1, 10), lambda y, x, c, dy=dy, dx=dx: scene(y - dy, x - dx), width=size, height=size)
+            frames.append(path)
+        def fused(name, *args):
+            report, rgb = self.fuse(name, *frames, "--reference", "1", *args)
+            # Green sites hold the merged value itself, without demosaicing.
+            errors = [rgb["G"][y * size + x] - scene(y, x)
+                      for y in range(8, size - 8) for x in range(8, size - 8) if (y + x) % 2]
+            return report, math.sqrt(sum(e * e for e in errors) / len(errors))
+        _, blurred = fused("plain", "--no-deghost")
+        report, aligned = fused("applied", "--no-deghost", "--align", "apply")
+        self.assertTrue(report["alignment"]["applied"])
+        self.assertEqual(sum(f["applied"] for f in report["alignment"]["frames"]), 3)
+        self.assertLess(aligned, blurred / 4)
+        self.assertLess(aligned, 0.002)
+        # Deghosting compares the aligned frames and finds nothing moving.
+        report, _ = fused("deghosted", "--align", "apply")
+        self.assertEqual(report["merge"]["moving_fraction"], 0)
 
     def test_nd_gate_counts_distinct_sites(self):
         # Repeated filtered frames of one small patch add observations, not coverage.

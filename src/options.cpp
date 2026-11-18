@@ -58,7 +58,7 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --normalize geomean|none
   --floor F                           Positive minimum in output units (off by default)
   --reference auto|N                  Frame number in the first group (positional order)
-  --align off|report                  Estimate motion between frames and report it (off)
+  --align off|report|apply            Estimate motion between frames; apply it in the merge (off)
   --no-deghost                        Disable motion rejection
   --deghost-ev EV                     Motion threshold (1)
   --bad-pixels dng|none|FILE           Defect list or DNG opcodes
@@ -178,7 +178,7 @@ Options parseOptions(int argc, char** argv) {
     oneOf("--highlights", o.highlights, {"reconstruct", "neutral", "bound"});
     oneOf("--demosaic", o.demosaic, {"bilinear", "mhc"});
     oneOf("--edges", o.edges, {"ratio", "linear"});
-    oneOf("--align", o.align, {"off", "report"});
+    oneOf("--align", o.align, {"off", "report", "apply"});
     oneOf("--exposures", o.exposures, {"measured", "exif"});
     if (o.matrix.rfind("custom:", 0) == 0) {
         const auto path = o.matrix.substr(7);
