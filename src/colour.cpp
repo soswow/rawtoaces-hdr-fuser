@@ -4,6 +4,8 @@
 #include <rawtoaces/image_converter.h>
 
 #include <cmath>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace rawfuse {
@@ -15,6 +17,34 @@ Matrix product(const Matrix& left, const Matrix& right) {
         for (int c = 0; c < 3; ++c)
             for (int k = 0; k < 3; ++k) result[r][c] += left[r][k] * right[k][c];
     return result;
+}
+
+// rawtoaces writes informational lines and warnings straight to std::cerr.
+// Collect them while it is configured so they follow --quiet and the
+// fuser's warning list. configureColour runs on one thread.
+class CaptureStderr {
+public:
+    CaptureStderr() : previous(std::cerr.rdbuf(text.rdbuf())) {}
+    CaptureStderr(const CaptureStderr&) = delete;
+    CaptureStderr& operator=(const CaptureStderr&) = delete;
+    ~CaptureStderr() { std::cerr.rdbuf(previous); }
+    std::vector<std::string> lines() const {
+        std::vector<std::string> result;
+        std::istringstream stream(text.str());
+        for (std::string line; std::getline(stream, line);) {
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\r')) line.pop_back();
+            if (!line.empty()) result.push_back(line);
+        }
+        return result;
+    }
+
+private:
+    std::ostringstream text;
+    std::streambuf* previous;
+};
+
+std::string afterPrefix(const std::string& line, const std::string& prefix) {
+    return line.rfind(prefix, 0) == 0 ? line.substr(prefix.size()) : std::string();
 }
 
 bool sensible(const RGB& wb) {
@@ -86,12 +116,33 @@ Colour configureColour(const std::vector<RawFrame>& plain, size_t reference,
     else converter.settings.matrix_method = Method::Metadata;
 
     OIIO::ParamValueList hints;
+    auto configure = [&] {
+        bool configured;
+        std::vector<std::string> lines;
+        {
+            CaptureStderr capture;
+            configured = converter.configure(ref.path.string(), hints);
+            lines = capture.lines();
+        }
+        for (const auto& line : lines) {
+            const auto fallback = afterPrefix(line, "Info: Falling back to metadata matrix method");
+            if (!fallback.empty() || line == "Info: Falling back to metadata matrix method") {
+                const auto start = fallback.find_first_not_of(". ");
+                auto reason = start == std::string::npos ? std::string() : fallback.substr(start);
+                if (reason.rfind("because ", 0) == 0) reason.erase(0, 8);
+                result.fallback = reason.empty() ? "no spectral data" : reason;
+            } else if (afterPrefix(line, "Info: ").empty()) {  // Informational lines are dropped
+                const auto warning = afterPrefix(line, "Warning: ");
+                const auto text = "rawtoaces: " + (warning.empty() ? line : warning);
+                // Each configure() repeats its warnings.
+                if (std::find(warnings.begin(), warnings.end(), text) == warnings.end()) warnings.push_back(text);
+            }
+        }
+        if (!configured)
+            throw std::runtime_error(converter.last_error_message.empty() ?
+                                     "could not configure rawtoaces" : converter.last_error_message);
+    };
     try {
-        auto configure = [&] {
-            if (!converter.configure(ref.path.string(), hints))
-                throw std::runtime_error(converter.last_error_message.empty() ?
-                                         "could not configure rawtoaces" : converter.last_error_message);
-        };
         configure();
         if (nativePlanes && o.matrix == "auto" && hints.contains("rta:FoundIlluminant")) {
             // Auto selected the RGB spectral solver rather than the native-plane
@@ -101,6 +152,10 @@ Colour configureColour(const std::vector<RawFrame>& plain, size_t reference,
             hints.clear();
             configure();
         }
+        if (o.matrix == "auto") result.method = hints.contains("rta:FoundIlluminant") ? "spectral" : "metadata";
+        else result.method = o.matrix.rfind("custom:", 0) == 0 ? "custom" : o.matrix;
+        if (result.method == "spectral" || o.matrix == "auto") result.databases = converter.settings.database_directories;
+        if (result.method == "spectral") result.fallback.clear();
         const auto& wb = converter.get_WB_multipliers();
         if (wb.size() >= 3 && sensible({wb[0], wb[1], wb[2]}))
             for (int c = 0; c < 3; ++c) result.wb[nativePlanes ? planes[c] : c] = wb[c];

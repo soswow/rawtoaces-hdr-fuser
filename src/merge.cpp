@@ -65,7 +65,7 @@ SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const
     const int colour = first.layout.colour(row, col);
     const size_t index = first.layout.index(row, col);
     double seed = 0, seedWeight = 0;
-    double boundExposure = std::numeric_limits<double>::infinity();
+    double bound = -1;  // Strongest clipped lower bound, in signal per unit exposure
     std::optional<Measurement> aboveHigh, adjacent;
     size_t longest = 0;
     thread_local std::vector<Measurement> usable;
@@ -74,7 +74,7 @@ SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const
     for (const auto& frame : frames) {
         const auto s = sample(frame, row, col, index, o);
         const double exposure = frame.effective;
-        if (s.state == SampleState::clipped && exposure < boundExposure) boundExposure = exposure;
+        if (s.state == SampleState::clipped) bound = std::max(bound, std::max(0.0, double(s.fraction)) / exposure);
         if (s.state == SampleState::aboveHigh && (!aboveHigh || exposure < aboveHigh->exposure))
             aboveHigh = {&frame, exposure, s.fraction, s.extra};
         if (s.state == SampleState::adjacentClip && (!adjacent || exposure < adjacent->exposure))
@@ -93,7 +93,7 @@ SiteMerge mergeSite(const std::vector<RawFrame>& frames, int row, int col, const
             fallback.flags |= adjacentClipFallback;
             return {fallback, adjacent->fraction < o.low};
         }
-        if (std::isfinite(boundExposure)) return {{float(1 / boundExposure), 0, lowerBound, 0}, false};
+        if (bound >= 0) return {{float(bound), 0, lowerBound, 0}, false};
         return {{0, 0, missing, 0}, false};
     }
     if (usable.size() == 1)

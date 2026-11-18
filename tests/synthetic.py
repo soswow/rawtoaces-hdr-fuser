@@ -27,7 +27,7 @@ def dng(path, exposure, value, *, order="<", width=SIZE, height=SIZE,
         bad=b"", gains=b"", neutral=((1, 2), (1, 1), (5, 8)), subifd=False,
         active=None, final_opcode=b"", iso=100, aperture=(11, 5),
         cfa=CFA, black_pattern=None, black_rows=None, black_cols=None,
-        plane_colours=(0, 1, 2), noise=(S, O), date=b"2026:01:02 03:04:05\0"):
+        plane_colours=(0, 1, 2), noise=(S, O), date=b"2026:01:02 03:04:05\0", offset=None):
     def pack(form, *values):
         return struct.pack(order + form, *values)
 
@@ -89,6 +89,8 @@ def dng(path, exposure, value, *, order="<", width=SIZE, height=SIZE,
     ]
     if date:
         exif.append(blob(36867, 2, date))
+    if offset:
+        exif.append(blob(36881, 2, offset))
     data = bytearray(8192)
     tail = 4096
 
@@ -286,14 +288,14 @@ def main(exe, folder):
     _, (_, highlight) = fuse("highlight", sat, "--space", "aces", "--wb", "custom:2,1,3",
                               "--matrix", f"custom:{matrix}", "--aux", "--highlights", "neutral")
     for c in "RGB":
-        close(highlight[c][2 * SIZE + 2], 3)
+        close(highlight[c][2 * SIZE + 2], 3 * 0.999)  # The clipping threshold, at the default margin
     assert highlight["flags"][2 * SIZE + 2] & 1
     # Reconstruction gives the fully clipped area the rim's colour (equal raw
     # values) at the lowest level its bounds allow.
     _, (_, highlight) = fuse("highlight-rim", sat, "--space", "aces", "--wb", "custom:2,1,3",
                               "--matrix", f"custom:{matrix}", "--aux")
     for c, expected in zip("RGB", (1, 2, 3)):
-        close(highlight[c][2 * SIZE + 2], expected)
+        close(highlight[c][2 * SIZE + 2], expected * 0.999)
     assert highlight["flags"][2 * SIZE + 2] & 1
 
     edge_short = folder / "edge-short.dng"
@@ -522,7 +524,7 @@ def main(exe, folder):
         close(composed[c][row + 46], 0.3)  # Later clean measurement wins in overlap.
         close(composed[c][row + 60], 0.3)  # ND contribution outside validity is ignored.
         close(composed[c][row + 73], 0.6, 0.001)  # ND beats the clipped clear bracket.
-        close(composed[c][row + 82], 1)
+        close(composed[c][row + 82], 0.999)  # Clipped lower bound at the clipping threshold
         close(composed[c][row + 99], 0.2)  # Boundary interpolation skips uncovered taps.
         close(composed[c][row + 108], 0)
     assert composed["source"][row + 20] == 1

@@ -19,6 +19,11 @@ constexpr size_t minimumSamples = 2000;
 constexpr double referenceVariance = 0.01, sampleVariance = 0.04, driftVariance = 0.04;
 struct Samples {
     std::array<std::vector<float>, 3> ev;
+    // The site behind each ev observation. Repeated filtered frames observe the
+    // same site against the same reference estimate, so coverage is gated on
+    // distinct sites, not on observations.
+    std::array<std::vector<uint32_t>, 3> site;
+    std::array<size_t, 3> sites{};
     std::vector<float> drift;
 };
 
@@ -32,13 +37,14 @@ std::string seconds(double value) {
 std::string overlapError(const std::vector<RawFrame>& reference, const std::vector<RawFrame>& filtered,
                          const NDResult& estimate) {
     std::ostringstream message;
-    message << "insufficient overlap with the calibration reference (R/G/B " << estimate.samples[0] << '/'
-            << estimate.samples[1] << '/' << estimate.samples[2] << " usable sites; need " << minimumSamples
-            << " per colour). A usable site is unclipped with SNR of at least 10 in the reference merge, "
+    message << "insufficient overlap with the calibration reference (R/G/B " << estimate.sites[0] << '/'
+            << estimate.sites[1] << '/' << estimate.sites[2] << " distinct usable sites from "
+            << estimate.samples[0] << '/' << estimate.samples[1] << '/' << estimate.samples[2]
+            << " frame observations; need " << minimumSamples << " sites per colour). A usable site is unclipped with SNR of at least 10 in the reference merge, "
                "and an attenuated frame records it unclipped with a predicted SNR of at least 5";
     double strongest = -1;
     for (int c = 0; c < 3; ++c)
-        if (estimate.samples[c] >= 50) strongest = std::max(strongest, estimate.measured[c]);
+        if (estimate.sites[c] >= 50) strongest = std::max(strongest, estimate.measured[c]);
     if (strongest >= 0) {
         // The longest attenuated frame records what this unattenuated exposure would.
         const double equivalent = filtered.back().effective * std::exp2(-strongest);
@@ -86,7 +92,12 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
         parallelRows(down, o.threads, [&](int by) {
             for (int bx = 0; bx < across; ++bx) {
                 auto& block = blocks[size_t(by) * across + bx];
-                for (int c = 0; c < 3; ++c) if (include[c]) block.ev[c].clear();
+                for (int c = 0; c < 3; ++c)
+                    if (include[c]) {
+                        block.ev[c].clear();
+                        block.site[c].clear();
+                        block.sites[c] = 0;
+                    }
                 if (collectDrift) block.drift.clear();
                 for (int y = by * blockSize; y < std::min((by + 1) * blockSize, layout.height); y += stride) {
                     for (int x = bx * blockSize; x < std::min((bx + 1) * blockSize, layout.width); x += stride) {
@@ -110,10 +121,16 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
                                 if (expected < o.low || expected > 0.8 * o.high ||
                                     relativeVariance(frame, colour, expected, s.extra) >= sampleVariance)
                                     continue;
-                                constexpr size_t maxBlockSamples = 2048;
-                                auto& values = block.ev[colour];
-                                if (values.size() < maxBlockSamples)
-                                    values.push_back(float(std::log2(frame.effective * measurement.signal / s.fraction)));
+                                // At most 2,048 sites per colour and block (a 64 × 64 block
+                                // holds that many green sites), with every frame observing them.
+                                constexpr size_t maxBlockSites = 2048;
+                                auto& sites = block.site[colour];
+                                if (sites.empty() || sites.back() != i) {
+                                    if (block.sites[colour] == maxBlockSites) continue;
+                                    ++block.sites[colour];
+                                }
+                                block.ev[colour].push_back(float(std::log2(frame.effective * measurement.signal / s.fraction)));
+                                sites.push_back(uint32_t(i));
                             }
                         }
                         if (unfiltered && reliable < driftVariance) {
@@ -167,7 +184,7 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
         }
     }
     auto estimate = [&](int c) {
-        result.samples[c] = 0;
+        result.samples[c] = result.sites[c] = 0;
         std::vector<double> values;
         size_t count = 0;
         for (const auto& b : blocks) count += b.ev[c].size();
@@ -179,12 +196,24 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
             std::transform(values.begin(), values.end(), deviations.begin(),
                            [centre](double value) { return std::abs(value - centre); });
             const double cutoff = std::max(0.1, 4 * median(deviations));
-            values.erase(std::remove_if(values.begin(), values.end(), [&](double value) {
-                return std::abs(value - centre) > cutoff;
-            }), values.end());
+            // A site's observations are adjacent, so distinct kept sites are the
+            // changes of site along the kept observations.
+            size_t kept = 0;
+            for (const auto& b : blocks) {
+                uint32_t last = 0;
+                bool any = false;
+                for (size_t k = 0; k < b.ev[c].size(); ++k) {
+                    if (std::abs(b.ev[c][k] - centre) > cutoff) continue;
+                    values[kept++] = b.ev[c][k];
+                    if (!any || b.site[c][k] != last) ++result.sites[c];
+                    last = b.site[c][k];
+                    any = true;
+                }
+            }
+            values.resize(kept);
             result.samples[c] = values.size();
             if (!values.empty()) result.measured[c] = median(values);
-            if (values.size() >= minimumSamples) {
+            if (result.sites[c] >= minimumSamples) {
                 deviations.resize(values.size());
                 std::transform(values.begin(), values.end(), deviations.begin(),
                                [&](double value) { return std::abs(value - result.measured[c]); });
@@ -208,20 +237,20 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
         std::array<bool, 3> retry{};
         for (int c = 0; c < 3; ++c) {
             estimate(c);
-            retry[c] = result.samples[c] < minimumSamples;
+            retry[c] = result.sites[c] < minimumSamples;
         }
         if (stride > 1 && std::any_of(retry.begin(), retry.end(), [](bool value) { return value; })) {
             gather(1, retry, false, rough);
             for (int c = 0; c < 3; ++c) if (retry[c]) estimate(c);
         }
     }
-    const bool enough = std::all_of(result.samples.begin(), result.samples.end(),
+    const bool enough = std::all_of(result.sites.begin(), result.sites.end(),
         [](size_t count) { return count >= minimumSamples; });
 
     if (manualEV) {
         result.ev = *manualEV;
         for (int c = 0; c < 3; ++c)
-            if (result.samples[c] >= minimumSamples && std::abs(result.measured[c] - (*manualEV)[c]) > 0.2) {
+            if (result.sites[c] >= minimumSamples && std::abs(result.measured[c] - (*manualEV)[c]) > 0.2) {
                 warnings.push_back("measured attenuation differs from the supplied ev by more than 0.2 EV");
                 break;
             }
@@ -236,7 +265,7 @@ NDResult calibrateND(const MergeResult& merged, const std::vector<RawFrame>& ref
                 throw std::runtime_error("measured attenuation is outside the expected range; check masks and scene overlap");
     }
     for (int c = 0; c < 3; ++c)
-        if (result.samples[c] < minimumSamples) result.measured[c] = std::numeric_limits<double>::quiet_NaN();
+        if (result.sites[c] < minimumSamples) result.measured[c] = std::numeric_limits<double>::quiet_NaN();
 
     size_t flagged = 0;
     for (size_t i = 0; i < blocks.size(); ++i) {

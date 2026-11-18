@@ -70,10 +70,14 @@ bool interpolateMissing(const std::vector<Site>& sites, const Layout& layout,
     return true;
 }
 
+// Mirror about the first and last sites, repeatedly, so any offset lands
+// inside the image with its Bayer parity kept (the period 2·(limit − 1) is even).
 int mirror(int p, int limit) {
-    if (p < 0) p = -p;
-    if (p >= limit) p = 2 * (limit - 1) - p;
-    return std::abs(p);
+    if (limit < 2) return 0;
+    const int period = 2 * (limit - 1);
+    p %= period;
+    if (p < 0) p += period;
+    return p < limit ? p : period - p;
 }
 
 struct Tap { size_t index; float weight; };
@@ -175,18 +179,35 @@ constexpr double edgeStart = 0.6931471805599453, edgeFull = 1.3862943611198906; 
 constexpr double edgeSnr2 = 64;  // 8 σ
 constexpr int edgeReach = 3;
 
+// The sites one edge estimate read, for its flags and source IDs.
+struct EdgeDependencies {
+    std::array<size_t, (2 * edgeReach + 1) * (2 * edgeReach + 1)> index{};
+    int size = 0;
+    void add(size_t i) {
+        for (int k = 0; k < size; ++k) if (index[k] == i) return;
+        index[size++] = i;
+    }
+};
+
 struct EdgeEstimator {
     const std::vector<Site>& sites;
     const Layout& layout;
 
-    const Site& at(int y, int x) const {
-        return sites[layout.index(mirror(y, layout.height), mirror(x, layout.width))];
-    }
+    size_t indexAt(int y, int x) const { return layout.index(mirror(y, layout.height), mirror(x, layout.width)); }
+    const Site& at(int y, int x) const { return sites[indexAt(y, x)]; }
+    // Lower bounds (zero variance) pass the noise test and are used at their
+    // value, as the linear kernels use them; excluding them falls back to those
+    // kernels, which fringe worse beside a clipped core. Their LOWER_BOUND flag
+    // reaches the output through the estimate's dependencies.
     bool usable(const Site& s) const {
         return !(s.flags & uncovered) && (s.flags & (missing | filled)) != missing && s.signal > 0 &&
                double(s.signal) * s.signal >= edgeSnr2 * s.variance;
     }
-    double log(int y, int x) const { return std::log(double(at(y, x).signal)); }
+    double log(int y, int x, EdgeDependencies& used) const {
+        const size_t i = indexAt(y, x);
+        used.add(i);
+        return std::log(double(sites[i].signal));
+    }
 
     // Log-range of the taps a straight average would use, or a negative value
     // when any of them is too dark or noisy for log-space estimates.
@@ -213,13 +234,13 @@ struct EdgeEstimator {
         return true;
     }
 
-    double logGreen(int y, int x) const {
-        const double centre = log(y, x);
+    double logGreen(int y, int x, EdgeDependencies& used) const {
+        const double centre = log(y, x, used);
         if (layout.colour(mirror(y, layout.height), mirror(x, layout.width)) == 1) return centre;
         double sum = 0, weights = 0, lo = INFINITY, hi = -INFINITY;
         for (auto [a, b] : {std::pair{0, 1}, std::pair{1, 0}}) {
-            const double g0 = log(y - a, x - b), g1 = log(y + a, x + b);
-            const double c0 = log(y - 2 * a, x - 2 * b), c1 = log(y + 2 * a, x + 2 * b);
+            const double g0 = log(y - a, x - b, used), g1 = log(y + a, x + b, used);
+            const double c0 = log(y - 2 * a, x - 2 * b, used), c1 = log(y + 2 * a, x + 2 * b, used);
             const double estimate = 0.5 * (g0 + g1) + 0.125 * (2 * centre - c0 - c1);
             const double gradient = std::abs(g0 - g1) + std::abs(2 * centre - c0 - c1) + 1e-3;
             sum += estimate / gradient;
@@ -230,14 +251,14 @@ struct EdgeEstimator {
         return std::clamp(sum / weights, lo, hi);
     }
 
-    double estimate(int y, int x, int target) const {
-        const double green = logGreen(y, x);
+    double estimate(int y, int x, int target, EdgeDependencies& used) const {
+        const double green = logGreen(y, x, used);
         if (target == 1) return std::exp(green);
         const int own = layout.colour(y, x);
         double ratio = 0;
         int count = 0;
         auto add = [&](int dy, int dx) {
-            ratio += log(y + dy, x + dx) - logGreen(y + dy, x + dx);
+            ratio += log(y + dy, x + dx, used) - logGreen(y + dy, x + dx, used);
             ++count;
         };
         if (own == 1) {
@@ -329,6 +350,12 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
 
     std::vector<std::array<double, 3>> sums;
     std::vector<int> rimQuads;
+    // The rim sets the region's colour, so its flags and sources are donors too.
+    std::vector<uint16_t> rimFlags;
+    std::vector<uint32_t> rimSources;
+    auto combine = [](uint32_t current, uint32_t donor) {
+        return !donor ? current : !current || current == donor ? donor : mixedSource;
+    };
     std::vector<int32_t> seen(region.size(), unclipped);
     std::vector<size_t> queue;
     for (size_t i : clipped) {
@@ -337,6 +364,8 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
         const auto label = int32_t(sums.size());
         sums.push_back({});
         rimQuads.push_back(0);
+        rimFlags.push_back(0);
+        rimSources.push_back(0);
         region[start] = label;
         queue.assign(1, start);
         for (size_t k = 0; k < queue.size(); ++k) {
@@ -355,6 +384,8 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
                     if (2 * ny + 1 >= layout.height || 2 * nx + 1 >= layout.width) continue;
                     std::array<double, 3> quad{};
                     bool measured = true;
+                    uint16_t quadFlags = 0;
+                    uint32_t quadSource = 0;
                     for (int y = 2 * ny; y < 2 * ny + 2 && measured; ++y)
                         for (int x = 2 * nx; x < 2 * nx + 2; ++x) {
                             const size_t j = layout.index(y, x);
@@ -364,10 +395,14 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
                             }
                             const int c = layout.colour(y, x);
                             quad[c] += sites[j].signal * wb[c] * (c == 1 ? 0.5 : 1);
+                            quadFlags |= sites[j].flags;
+                            if (!sources.empty()) quadSource = combine(quadSource, sources[j]);
                         }
                     if (!measured) continue;
                     for (int c = 0; c < 3; ++c) sums[label][c] += quad[c];
                     ++rimQuads[label];
+                    rimFlags[label] |= quadFlags;
+                    rimSources[label] = combine(rimSources[label], quadSource);
                 }
         }
     }
@@ -378,16 +413,19 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
     for (size_t i : clipped) {
         const int y = int(i / layout.width), x = int(i % layout.width);
         const int c = layout.colour(y, x);
-        const auto& sum = sums[region[quadOf(i)]];
-        const bool coloured = rimQuads[region[quadOf(i)]] >= 4 && sum[0] > 0 && sum[1] > 0 && sum[2] > 0;
+        const auto label = region[quadOf(i)];
+        const auto& sum = sums[label];
+        const bool coloured = rimQuads[label] >= 4 && sum[0] > 0 && sum[1] > 0 && sum[2] > 0;
         double lower = sites[i].signal * wb[c], estimate = 0, estimateVariance = 0;
         int estimates = 0;
-        uint16_t donorFlags = 0;
-        uint32_t source = sources.empty() ? 0 : sources[i];
+        uint16_t donorFlags = 0, lowerFlags = 0;
+        uint32_t source = sources.empty() ? 0 : sources[i], lowerSource = 0;
+        bool raisedByNeighbour = false;
         for (int k = 0; k < 3; ++k) {
             if (k == c) continue;
             const double ratio = coloured ? sum[c] / sum[k] : 1;
             double total = 0, variance = 0, bound = 0;
+            size_t boundSite = 0;
             int count = 0;
             uint16_t flags = 0;
             uint32_t donor = 0;
@@ -400,7 +438,10 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
                     if (!valued(j)) continue;
                     const double value = sites[j].signal * wb[k];
                     if (sites[j].flags & lowerBound) {
-                        bound = std::max(bound, value);
+                        if (value > bound) {
+                            bound = value;
+                            boundSite = j;
+                        }
                         continue;
                     }
                     total += value;
@@ -410,7 +451,12 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
                         donor = !donor || donor == sources[j] ? sources[j] : mixedSource;
                     ++count;
                 }
-            lower = std::max(lower, ratio * bound);
+            if (ratio * bound > lower) {
+                lower = ratio * bound;
+                lowerFlags = sites[boundSite].flags;
+                lowerSource = sources.empty() ? 0 : sources[boundSite];
+                raisedByNeighbour = true;
+            }
             if (!count) continue;
             const double value = ratio * total / count;
             // Two channels estimate the same quantity when the colour is known.
@@ -429,13 +475,26 @@ void reconstructHighlights(std::vector<Site>& sites, const Layout& layout, const
             estimateVariance /= double(estimates) * estimates;
         }
         double value = lower, variance = 0;
+        uint16_t flags = sites[i].flags | reconstructed;
         if (estimates && estimate > lower) {
             value = estimate;
             variance = estimateVariance;
+            flags |= donorFlags;
+        } else {
+            // The level comes from a bound: this site's own, or a neighbour's
+            // carried through the ratio.
+            source = sources.empty() ? 0 : sources[i];
+            if (raisedByNeighbour) {
+                flags |= lowerFlags;
+                source = combine(source, lowerSource);
+            }
         }
         if (value <= sites[i].signal * wb[c]) continue;
-        updates.push_back({i, float(value / wb[c]), float(variance / (wb[c] * wb[c])),
-                           uint16_t(sites[i].flags | reconstructed | donorFlags), source});
+        if (coloured) {
+            flags |= rimFlags[label];
+            source = combine(source, rimSources[label]);
+        }
+        updates.push_back({i, float(value / wb[c]), float(variance / (wb[c] * wb[c])), flags, source});
     }
     for (const auto& u : updates) {
         sites[u.index].signal = u.signal;
@@ -596,9 +655,11 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
             }
 
             // Steep edges: blend toward the log-space estimate and rescale the
-            // kernel to it, so variance keeps its relative size and provenance
-            // still comes from the same taps.
+            // kernel to it, so variance keeps its relative size (an approximation:
+            // the estimate is nonlinear in sites beyond the kernel). Flags and
+            // source IDs also include every site the estimate read.
             bool edge = false;
+            std::array<EdgeDependencies, 3> edgeUsed;
             if (useEdges) {
                 const int own = layout.colour(y, x);
                 const double range = edges.contrast(kernels, own);
@@ -606,7 +667,7 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
                     const double weight = std::min(1.0, (range - edgeStart) / (edgeFull - edgeStart));
                     for (int c = 0; c < 3; ++c) {
                         if (c == own || camera[c] <= 0) continue;
-                        const double value = camera[c] + weight * (edges.estimate(y, x, c) - camera[c]);
+                        const double value = camera[c] + weight * (edges.estimate(y, x, c, edgeUsed[c]) - camera[c]);
                         const float factor = float(value / camera[c]);
                         for (int j = 0; j < kernels[c].size; ++j) kernels[c].taps[j].weight *= factor;
                         camera[c] = value;
@@ -646,18 +707,24 @@ Output render(const std::vector<Site>& sites, const Layout& layout, const Colour
                         it->second += transform[c][k] * tap.weight * scale;
                     }
                 }
+                auto depend = [&](size_t index) {
+                    const auto& site = sites[index];
+                    frames = std::max(frames, site.frames);
+                    flags |= site.flags;
+                    if (!sources.empty() && sources[index]) {
+                        const uint32_t contributor = sources[index];
+                        source = !source || source == contributor ? contributor : mixedSource;
+                    }
+                };
                 double variance = 0;
                 for (auto it = combined.begin(); it != combined.begin() + count; ++it) {
                     if (!it->second) continue;
-                    const auto& site = sites[it->first];
-                    variance += it->second * it->second * site.variance;
-                    frames = std::max(frames, site.frames);
-                    flags |= site.flags;
-                    if (!sources.empty() && sources[it->first]) {
-                        const uint32_t contributor = sources[it->first];
-                        source = !source || source == contributor ? contributor : mixedSource;
-                    }
+                    variance += it->second * it->second * sites[it->first].variance;
+                    depend(it->first);
                 }
+                for (int k = 0; k < 3; ++k)
+                    if (transform[c][k] != 0)
+                        for (int j = 0; j < edgeUsed[k].size; ++j) depend(edgeUsed[k].index[j]);
                 if (!std::isfinite(float(variance))) throw std::runtime_error("output variance overflows float32");
                 output.variance[i * 3 + c] = float(variance);
             }

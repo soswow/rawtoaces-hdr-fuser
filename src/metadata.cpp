@@ -324,6 +324,8 @@ Metadata readDngMetadata(const fs::path& path, Warnings& warnings) {
     meta.aperture = tiff.scalar(exposureTag(33437), 33437);
     meta.captureDate = tiff.string(exposureTag(36867), 36867);
     if (meta.captureDate.empty()) meta.captureDate = tiff.string(imageTag(306), 306);
+    meta.captureOffset = tiff.string(exposureTag(36881), 36881);
+    if (meta.captureOffset.empty()) meta.captureOffset = tiff.string(exposureTag(36880), 36880);
     meta.description = tiff.string(imageTag(270), 270);
     meta.xmp = tiff.string(imageTag(700), 700, false);
     meta.baseline = tiff.scalar(imageTag(50730), 50730);

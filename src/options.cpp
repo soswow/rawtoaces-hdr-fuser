@@ -61,6 +61,8 @@ Merge fixed-camera Bayer exposures into a linear float OpenEXR.
   --no-deghost                        Disable motion rejection
   --deghost-ev EV                     Motion threshold (1)
   --bad-pixels dng|none|FILE           Defect list or DNG opcodes
+  --camera-timezone +HH:MM            UTC offset of the camera clock, for dated defects
+                                      when a capture has no EXIF OffsetTimeOriginal
   --dark-model CSV                    Per-site dark correction model
   --dark-model-error F                Minimum relative model uncertainty (0.10)
   --noise auto|S,O                    Normalized shot/read noise (auto: DNG profile, else measured)
@@ -135,6 +137,11 @@ Options parseOptions(int argc, char** argv) {
         } else if (key == "--threads") o.threads = unsigned(integer(argument(), 1, 1024));
         else if (key == "--clip-dilate") o.clipDilate = integer(argument(), 0, 65535);
         else if (key == "--allow-scene-drift") o.allowSceneDrift = true;
+        else if (key == "--camera-timezone") {
+            const auto value = argument();
+            o.cameraOffset = parseUtcOffset(value);
+            if (!o.cameraOffset) throw std::runtime_error("--camera-timezone expects +HH:MM or -HH:MM, got " + value);
+        }
         else if (key == "--no-deghost") o.deghost = false;
         else if (key == "--aux") o.aux = true;
         else if (key == "--force") o.force = true;
@@ -142,6 +149,8 @@ Options parseOptions(int argc, char** argv) {
         else if (key == "-q" || key == "--quiet") o.quiet = true;
         else throw std::runtime_error("unknown option: " + key);
     }
+
+    if (o.quiet) o.verbose = false;  // -q wins over -v
 
     if (!o.manifest.empty()) {
         if (!o.plain.empty()) throw std::runtime_error("--groups takes input frames from the manifest");

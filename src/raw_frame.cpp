@@ -2,6 +2,7 @@
 
 #include <libraw/libraw.h>
 
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <fstream>
@@ -11,6 +12,30 @@
 
 namespace rawfuse {
 namespace {
+
+// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's
+// days_from_civil), so dates convert without the host's time zone or timegm().
+long long daysFromCivil(long long y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const long long era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = unsigned(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// EXIF "YYYY:MM:DD HH:MM:SS" as seconds since the epoch, read as if it were UTC.
+std::optional<long long> wallClockSeconds(const std::string& text) {
+    int year, month, day, hour, minute, second;
+    char a, b, c, d;
+    std::istringstream stream(text);
+    if (!(stream >> year >> a >> month >> b >> day >> hour >> c >> minute >> d >> second) ||
+        a != ':' || b != ':' || c != ':' || d != ':' || year < 1971 || month < 1 || month > 12 ||
+        day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 60)
+        return std::nullopt;
+    return daysFromCivil(year, unsigned(month), unsigned(day)) * 86400 + hour * 3600 + minute * 60 + second;
+}
+
 
 void readLevels(RawFrame& frame, LibRaw& raw, Warnings& warnings) {
     const auto& meta = frame.metadata;
@@ -177,6 +202,22 @@ void markClipping(RawFrame& frame, const Options& o, std::vector<uint8_t>& horiz
     });
 }
 
+// The UTC capture time needs the recorded date and a UTC offset: the file's own,
+// else --camera-timezone. Without one the time is unknown, rather than taken in
+// the host's time zone, so results do not depend on where rawfuse runs.
+void resolveCaptureTime(RawFrame& frame, const Options& o) {
+    frame.captureTimestamp = 0;
+    frame.captureTimeSource.clear();
+    if (!frame.wallClock) return;
+    std::optional<int> offset = parseUtcOffset(frame.metadata.captureOffset);
+    if (offset) frame.captureTimeSource = "exif_offset";
+    else if ((offset = o.cameraOffset)) frame.captureTimeSource = "camera_timezone";
+    else return;
+    const long long utc = *frame.wallClock - *offset;
+    if (utc > 0) frame.captureTimestamp = utc;
+    else frame.captureTimeSource.clear();
+}
+
 void markDefects(RawFrame& frame, const Options& options, const std::vector<BadPixel>& sidecar,
                  const DarkModel& model) {
     const auto& layout = frame.layout;
@@ -320,7 +361,6 @@ RawFrame readRaw(const fs::path& path, Warnings& warnings) {
         frame.model = info.model;
         auto& m = frame.metadata;
         const auto& other = raw->imgdata.other;
-        frame.captureTimestamp = std::max<long long>(0, other.timestamp);
         if (m.seconds <= 0) m.seconds = other.shutter;
         if (m.seconds <= 0 || !std::isfinite(m.seconds)) throw std::runtime_error("missing exposure time");
         if (m.exposure.empty()) {
@@ -341,6 +381,7 @@ RawFrame readRaw(const fs::path& path, Warnings& warnings) {
                 m.captureDate = text.str();
             }
         }
+        frame.wallClock = wallClockSeconds(m.captureDate);
         const auto& c = raw->imgdata.color;
         for (int i = 0; i < 3; ++i) {
             const int colour = m.planeColours[i];
@@ -493,6 +534,7 @@ Preparation prepareFrames(const FrameGroups& groups, const Sidecars& sidecars,
         const auto& validity = sidecars.valid.empty() ? empty : sidecars.valid[g];
         for (auto& frame : *groups[g]) {
             markClipping(frame, o, horizontal, validity);
+            resolveCaptureTime(frame, o);
             markDefects(frame, o, bad, model);
             undated += frame.undatedDefects != 0;
             for (size_t i = 0; i < validity.size(); ++i)
@@ -512,25 +554,46 @@ Preparation prepareFrames(const FrameGroups& groups, const Sidecars& sidecars,
                 " sweep has too few usable dark-model sites to fit; treating model sites as missing");
     }
     if (undated)
-        warnings.push_back(std::to_string(undated) + " input frames have no capture time; "
-                           "excluding every dated bad-pixel list entry");
+        warnings.push_back(std::to_string(undated) + " input frames have no capture time with a known UTC "
+                           "offset; excluding every dated bad-pixel list entry (--camera-timezone sets the "
+                           "offset for captures without EXIF OffsetTimeOriginal)");
     return result;
+}
+
+std::optional<int> parseUtcOffset(const std::string& raw) {
+    std::string text = raw;
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\0')) text.pop_back();
+    if (text == "Z" || text == "UTC" || text == "+00:00" || text == "-00:00") return 0;
+    if (text.size() < 3 || (text[0] != '+' && text[0] != '-')) return std::nullopt;
+    std::string digits;
+    for (size_t k = 1; k < text.size(); ++k) {
+        if (std::isdigit(static_cast<unsigned char>(text[k]))) digits += text[k];
+        else if (!(text[k] == ':' && k == 3)) return std::nullopt;
+    }
+    if (digits.size() != 2 && digits.size() != 4) return std::nullopt;
+    const int hours = std::stoi(digits.substr(0, 2)), minutes = digits.size() == 4 ? std::stoi(digits.substr(2)) : 0;
+    if (hours > 14 || minutes > 59 || hours * 60 + minutes > 14 * 60) return std::nullopt;
+    const int seconds = (hours * 60 + minutes) * 60;
+    return text[0] == '-' ? -seconds : seconds;
 }
 
 Sample sample(const RawFrame& frame, int row, int col, size_t index, const Options& o) {
     const auto mask = frame.rejected[index];
     if (mask & (excluded | outsideValidity)) return {SampleState::missing};
-    if (mask & saturated) return {SampleState::clipped};
     const float black = frame.black(row, col);
     const double full = frame.white - black;
     double dark = 0, extra = 0;
+    const bool clipped = mask & saturated;
     if (mask & modeled) {
         const auto it = std::lower_bound(frame.dark.begin(), frame.dark.end(), index,
             [](const auto& entry, size_t site) { return entry.first < site; });
         dark = it->second / full;
+        // A clipped site read at least the clipping threshold, which bounds its signal.
+        if (clipped) return {SampleState::clipped, float(1 - o.clipMargin - dark)};
         const double sigma = frame.darkUncertainty * dark;
         extra = frame.noise[frame.layout.colour(row, col)].shot * std::max(0.0, dark) + sigma * sigma;
     }
+    if (clipped) return {SampleState::clipped, float(1 - o.clipMargin)};
     const float fraction = float((frame.raw(row, col) - black) / full - dark);
     if (mask & bloom) return {SampleState::adjacentClip, fraction, float(extra)};
     return {fraction <= o.high ? SampleState::usable : SampleState::aboveHigh, fraction, float(extra)};
